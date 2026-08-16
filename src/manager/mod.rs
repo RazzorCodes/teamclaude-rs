@@ -182,6 +182,14 @@ const STREAM_ERROR_WINDOW_MS: i64 = 3_600_000;
 /// without bound even inside the decay window.
 const STREAM_ERROR_CAP: usize = 64;
 
+/// Default per-request timeout for TCR-2 provider-dispatch sends (see
+/// `Manager::provider_dispatch_timeout_ms` for why this exists at all, and why
+/// it is distinct from the Anthropic fleet client's deliberate lack of one).
+/// 120s: generous for a non-streaming LLM completion (most land well under
+/// 60s) while still bounding a silently-hung third-party endpoint to a wait a
+/// human notices, not one they give up on.
+const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS: u64 = 120_000;
+
 /// Hard state of an account.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccountStatus {
@@ -811,6 +819,22 @@ pub struct Manager {
     /// ONLY on the false→true `quota_known` flip, which happens at most once per
     /// account per process, so it can never become a self-feeding loop of sweeps.
     warm_wake: Notify,
+    /// Client used for upstream forwarding — deliberately no total timeout so
+    /// long SSE streams are never cut (an idle guard belongs on the read side).
+    http: reqwest::Client,
+    /// Bound (in ms) applied per-request to TCR-2 provider-dispatch sends (see
+    /// `proxy::dispatch_provider_route`) — NOT to the Anthropic fleet path, which
+    /// shares `http` above and deliberately has none. Unlike Anthropic, an
+    /// arbitrary third-party provider that accepts a TCP connection and then
+    /// never responds is a realistic failure mode, and without a bound the send
+    /// hangs forever: it never reaches `classify_provider_failure`, so it never
+    /// advances to the next fallback candidate. Applied via
+    /// `reqwest::RequestBuilder::timeout` rather than a second `Client` with its
+    /// own `.timeout(...)` — one shared connection-pooling client, timeout is
+    /// just a per-request knob. Held as an `AtomicU64` (not a plain constant) so
+    /// tests can shrink it with `Manager::set_provider_dispatch_timeout_for_test`
+    /// instead of a real multi-minute wait to prove a hang gets bounded.
+    provider_dispatch_timeout_ms: AtomicU64,
     /// The persisted config, kept so token refreshes can be written back with
     /// every unmodelled field intact.
     config: Mutex<Config>,
@@ -1101,6 +1125,36 @@ impl Manager {
             warmer,
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
+            // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
+            // proxy — routing our upstream through an ambient proxy (e.g. the JS
+            // teamclaude on :3456) loops us through the thing we replace and every
+            // request dies as "upstream unreachable". Always reach Anthropic directly.
+            http: reqwest::Client::builder()
+                .no_proxy()
+                // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+                // otherwise stalls the attempt until the OS TCP timeout, and with a
+                // retry budget of `account_count * 2 + 4` that is many minutes of a
+                // hung request. `oauth.rs` and `probe.rs` both already set one.
+                //
+                // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+                // responses are long-lived SSE streams that legitimately run longer
+                // than any bound worth setting, and a total timeout would truncate
+                // them mid-stream. `connect_timeout` cannot — it applies only before
+                // the response headers arrive, so once a stream is flowing it is out
+                // of the picture.
+                .connect_timeout(std::time::Duration::from_secs(10))
+                // Keep the single HTTP/2 connection to Anthropic warm across
+                // interactive think-time pauses. reqwest reaps idle connections
+                // after 90s by default, but a coding session routinely pauses
+                // longer — so the next request would pay a fresh TCP+TLS handshake
+                // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
+                // connection open so a post-pause request skips the reconnect.
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .http2_keep_alive_while_idle(true)
+                .pool_idle_timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("build reqwest client"),
+            provider_dispatch_timeout_ms: AtomicU64::new(DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS),
             config: Mutex::new(config),
             config_write: Mutex::new(()),
             config_path,

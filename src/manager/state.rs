@@ -154,6 +154,26 @@ impl Manager {
             .map(|a| a.http.clone())
     }
 
+    /// Per-request timeout to apply to TCR-2 provider-dispatch sends (see the
+    /// `provider_dispatch_timeout_ms` field doc for why the fleet client above
+    /// must NOT get this same treatment).
+    pub fn provider_dispatch_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.provider_dispatch_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Test-only override so a hang-detection test can prove the timeout works
+    /// without actually waiting out the real (120s) production value.
+    #[cfg(test)]
+    pub fn set_provider_dispatch_timeout_for_test(&self, timeout: std::time::Duration) {
+        self.provider_dispatch_timeout_ms.store(
+            timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// The access token to inject for account `idx` (a clone — the request
     /// outlives the lock).
     pub fn access_token(&self, idx: usize) -> Option<String> {

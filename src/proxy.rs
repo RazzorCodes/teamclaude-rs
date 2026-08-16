@@ -3078,7 +3078,14 @@ async fn dispatch_provider_route(
         let url = format!("{}{}", provider.base_url, path_and_query);
         let mut builder = http
             .request(method.clone(), &url)
-            .headers(build_provider_headers(req_headers, provider));
+            .headers(build_provider_headers(req_headers, provider))
+            // Bounded per-request timeout — see `Manager::provider_dispatch_timeout`
+            // for why this does NOT belong on the shared fleet client that `http`
+            // (== manager.http_client()) also is. Without it, a third-party
+            // provider that accepts the TCP connection and then never responds
+            // hangs `send().await` forever: `classify_provider_failure` never
+            // gets called, so the walk never advances to the next candidate.
+            .timeout(manager.provider_dispatch_timeout());
         if *method != Method::GET && *method != Method::HEAD {
             builder = builder.body(out_body);
         }
@@ -10690,6 +10697,39 @@ mod tests {
             (format!("http://{addr}"), records)
         }
 
+        /// A fake third-party provider that accepts every TCP connection and then
+        /// never writes a response — the "half-configured / outage-mode
+        /// third-party endpoint" failure mode the blocking review finding
+        /// warned about. `connect_timeout` never fires (the connection DOES
+        /// succeed); only a bounded total/per-request timeout can move a hop
+        /// against this upstream past `send().await`.
+        async fn spawn_hanging_upstream() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hanging upstream");
+            let addr = listener.local_addr().expect("hanging upstream addr");
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    // Drain whatever the client sends and reply with nothing,
+                    // forever — the connection stays open and silent.
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => continue,
+                            }
+                        }
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
         fn env_auth(var: &str) -> ProviderAuth {
             ProviderAuth::Env {
                 var: var.to_string(),
@@ -10963,6 +11003,71 @@ mod tests {
 
             std::env::remove_var("TCR2_TEST_401_VAR_B");
             std::env::remove_var("TCR2_TEST_401_VAR_A");
+        }
+
+        // --- gate scenario 4: a hung provider (accepts, never responds) times out
+        // and falls back, rather than hanging `dispatch_provider_route` forever --
+
+        #[tokio::test]
+        async fn hung_provider_times_out_and_falls_back_instead_of_hanging_forever() {
+            std::env::set_var("TCR2_TEST_HANG_VAR_B", "secret-b");
+            std::env::set_var("TCR2_TEST_HANG_VAR_A", "secret-a");
+            let capture = TracingCapture::new();
+
+            let url_b = spawn_hanging_upstream().await;
+            let (url_a, records_a) = spawn_provider_upstream(200, r#"{"ok":true}"#).await;
+
+            let config = config_with_routes(
+                vec![
+                    provider("b", &url_b, env_auth("TCR2_TEST_HANG_VAR_B")),
+                    provider("a", &url_a, env_auth("TCR2_TEST_HANG_VAR_A")),
+                ],
+                vec![route("claude-sonnet-*", 0, &["b", "a"])],
+            );
+            let manager = Manager::with_live_refresher(config, None);
+            // Shrink the production 120s bound to 200ms so this test proves the
+            // SAME mechanism without actually waiting out the real value.
+            let dispatch_timeout = Duration::from_millis(200);
+            manager.set_provider_dispatch_timeout_for_test(dispatch_timeout);
+
+            // An outer bound at well over 2x the dispatch timeout: if the fix
+            // regresses (no timeout applied), `post_messages` hangs forever on
+            // b's silent connection and THIS wrapper is what turns that into a
+            // failing test rather than a hung `cargo test` run.
+            let outer_bound = dispatch_timeout * 2 + Duration::from_secs(5);
+            let (status, _) = tokio::time::timeout(
+                outer_bound,
+                post_messages(manager, body_for("claude-sonnet-4-6")),
+            )
+            .await
+            .expect(
+                "request must complete well within 2x the provider-dispatch timeout, \
+                     not hang — a hung result here means the timeout was not applied to \
+                     the provider-dispatch send",
+            );
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the client must see the FALLBACK's 200 after b's send times out"
+            );
+
+            assert_eq!(
+                records_a.lock().await.len(),
+                1,
+                "a served the request after b's timeout"
+            );
+
+            let log = capture.text();
+            assert!(
+                log.contains("provider hop failed")
+                    && log.contains("from_provider=b")
+                    && log.contains("to_provider=\"a\"")
+                    && log.contains("trigger=timeout"),
+                "expected a fallback log line naming both providers and the timeout trigger, got:\n{log}"
+            );
+
+            std::env::remove_var("TCR2_TEST_HANG_VAR_B");
+            std::env::remove_var("TCR2_TEST_HANG_VAR_A");
         }
     }
 }
