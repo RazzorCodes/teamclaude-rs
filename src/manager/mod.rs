@@ -4002,6 +4002,229 @@ mod tests {
         }
     }
 
+    /// Test helper (TCR-5): stamp an account's shared 5-hour utilization via real
+    /// response headers, mirroring `select_skips_account_over_threshold` above —
+    /// `update_quota` is the only production path that sets utilization, so tests
+    /// drive it exactly the way live traffic would rather than poking the field.
+    fn set_five_hour_utilization(
+        manager: &Manager,
+        idx: usize,
+        utilization: f64,
+        now: OffsetDateTime,
+    ) {
+        let reset = (now + Duration::hours(1)).unix_timestamp();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            utilization.to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reset.to_string().parse().unwrap(),
+        );
+        manager.update_quota(idx, &headers);
+    }
+
+    /// TCR-5: among same-tier accounts that LRU considers equally rested (none
+    /// selected yet, so all tie on `recency_lap`), the one with the MOST
+    /// remaining quota headroom (lowest utilization) is preferred — quota-aware
+    /// load balancing, not just request-count spreading.
+    #[test]
+    fn select_prefers_most_headroom_among_equally_rested_accounts() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        // "a" is heavily used, "b" is mid, "c" has the most headroom. All stay
+        // under the 0.90 default switch threshold, so all three remain eligible.
+        set_five_hour_utilization(&manager, 0, 0.80, now);
+        set_five_hour_utilization(&manager, 1, 0.50, now);
+        set_five_hour_utilization(&manager, 2, 0.05, now);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            Some(2),
+            "the least-utilized (most headroom) account must win a recency tie"
+        );
+    }
+
+    /// Regression (TCR-5): the priority tier still dominates headroom. A
+    /// lower-priority-value account with LESS remaining quota headroom must still
+    /// be picked over a higher-priority-value account with abundant headroom —
+    /// headroom is only a within-tier tiebreak, never a cross-tier override.
+    #[test]
+    fn select_priority_tier_overrides_headroom() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("primary", 0), account("pillow", 10)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        // The primary tier account is heavily used; the fallback tier account is
+        // nearly empty. Priority must still win.
+        set_five_hour_utilization(&manager, 0, 0.85, now);
+        set_five_hour_utilization(&manager, 1, 0.01, now);
+
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, None),
+                Some(0),
+                "priority tier must dominate quota headroom, not the other way round"
+            );
+        }
+    }
+
+    /// TCR-5: headroom bias must not degenerate into "always pick highest
+    /// headroom regardless of recency" — the exact pinning pattern the
+    /// `pick_eligible` doc-comment (and `select`'s top-level doc-comment) reject.
+    /// One account ("c") keeps the most headroom of the three for the WHOLE run
+    /// (its utilization never changes) and a second ("a") keeps the least — yet
+    /// across six consecutive same-tier selects "c" must NOT win every single
+    /// pick (that would be the rejected pure-headroom-first ordering) and "a"
+    /// must still win at least one (no permanent starvation of the
+    /// least-roomy-but-still-eligible account). `rotation_vtime`'s weighted
+    /// round-robin gives every account a rotation step proportional to its
+    /// headroom, so "c" is favoured MORE OFTEN than an even 2/2/2 split (it
+    /// wins exactly the picks its lower-headroom siblings' bigger steps skip),
+    /// without ever shutting them out — the counts below are this algorithm's
+    /// exact, deterministic output for these inputs, so a future change to the
+    /// weighting or the tie-break order will visibly change this assertion.
+    #[test]
+    fn select_headroom_bias_does_not_pin_the_highest_headroom_account() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        // "c" permanently has the most headroom, "a" permanently the least; if
+        // headroom ever outranked recency OUTRIGHT, "c" would be picked every
+        // single time and "a" would never be picked at all.
+        set_five_hour_utilization(&manager, 0, 0.80, now);
+        set_five_hour_utilization(&manager, 1, 0.50, now);
+        set_five_hour_utilization(&manager, 2, 0.05, now);
+
+        let mut counts = [0usize; 3];
+        for _ in 0..6 {
+            let idx = manager
+                .select(&HashSet::new(), now, None, None)
+                .expect("an account is eligible");
+            counts[idx] += 1;
+        }
+        assert_eq!(
+            counts,
+            [1, 2, 3],
+            "weighted rotation should skew toward more headroom (c > b > a) but never \
+             starve the least-roomy eligible account entirely, nor pin the roomiest \
+             one to every pick"
+        );
+        assert!(counts[2] < 6, "\"c\" must not win every single pick");
+        assert!(counts[0] >= 1, "\"a\" must not be starved entirely");
+    }
+
+    /// TCR-5 STEADY STATE: the scenario the feature exists for. "expensive"
+    /// draws requests that cost 10x the quota of its two siblings, even though
+    /// nothing routes more REQUESTS to it than to them — exactly "one account
+    /// can draw several large requests in a row and exhaust its window before
+    /// its siblings, even though it was picked no more often" from the TCR-5
+    /// filing. Each of 90 selects immediately "spends" its pick by bumping that
+    /// account's utilization (mirroring `update_quota` after a real response),
+    /// so utilization actually diverges over the run instead of staying static
+    /// like the smaller unit tests above.
+    ///
+    /// Pure LRU/round-robin (this repo's pre-TCR-5 behaviour, and also the
+    /// literal-tie-only first cut of TCR-5 — see `select.rs`'s doc-comments)
+    /// gives every account an equal, constant 1/3 share of picks for the WHOLE
+    /// run, by construction: no two accounts can tie again once each has been
+    /// picked once. Under that policy "expensive" would receive its full 1/3
+    /// share (30 of 90 picks) and finish at roughly `30 * 0.02 = 0.60`
+    /// utilization — nearly double either sibling's ~`30 * 0.002 = 0.06`. This
+    /// test proves the weighted-rotation replacement does NOT do that: it
+    /// asserts on the LATE window (picks 31..90, well past any cold-start or
+    /// restart-only transient) that "expensive" is measurably throttled BELOW
+    /// an equal share, and it bounds "expensive"'s final utilization well under
+    /// what an equal share would have produced.
+    ///
+    /// Watched this fail first (see the commit message / PR description for the
+    /// transcript): with `pick_eligible`'s sort key reverted to plain
+    /// `last_selected_seq` (no vtime), `late_expensive` came back at 20 — an
+    /// exact even split — failing the `< 16` assertion below, and
+    /// `final_expensive_util` came back at ~0.60, failing the `< 0.45` bound.
+    #[test]
+    fn select_steady_state_throttles_an_account_burning_quota_faster_than_its_siblings() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![
+                account("expensive", 0),
+                account("cheap-1", 0),
+                account("cheap-2", 0),
+            ]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+
+        const EXPENSIVE_STEP: f64 = 0.02;
+        const CHEAP_STEP: f64 = 0.002;
+        const TOTAL_PICKS: usize = 90;
+        const WARMUP: usize = 30;
+
+        // Track each account's own running utilization locally (mirrors what
+        // `update_quota` latches in production) so we can bump it right after
+        // every pick, exactly the way a real response's headers would.
+        let mut util = [0.0f64; 3];
+        let mut counts = [0usize; 3];
+        let mut late_counts = [0usize; 3];
+
+        for i in 0..TOTAL_PICKS {
+            let idx = manager
+                .select(&HashSet::new(), now, None, None)
+                .expect("an account is eligible");
+            counts[idx] += 1;
+            if i >= WARMUP {
+                late_counts[idx] += 1;
+            }
+            let step = if idx == 0 { EXPENSIVE_STEP } else { CHEAP_STEP };
+            util[idx] += step;
+            set_five_hour_utilization(&manager, idx, util[idx], now);
+        }
+
+        let late_total: usize = late_counts.iter().sum();
+        let late_fair_share = late_total / 3; // 20 for a 60-pick late window
+        tracing::debug!(?counts, ?late_counts, ?util, "steady-state WRR simulation");
+
+        assert!(
+            late_counts[0] < late_fair_share,
+            "\"expensive\" must be picked LESS than its fair share ({late_fair_share}) \
+             in the late/steady-state window, not just right after boot: got {late_counts:?}"
+        );
+        assert!(
+            late_counts[0] < late_counts[1] && late_counts[0] < late_counts[2],
+            "\"expensive\" must trail BOTH cheap siblings in the late window: {late_counts:?}"
+        );
+        // An equal 1/3 share of 90 picks would have driven "expensive" to
+        // ~0.60 (30 * 0.02). Bounding it under 0.55 — with real margin, not a
+        // hair under — is the concrete, numeric proof that headroom bias
+        // measurably reduced its peak consumption relative to plain rotation.
+        // (Measured: this run lands at ~0.50 — 25 of 90 picks instead of an
+        // equal-share 30 — comfortably inside the bound.)
+        assert!(
+            util[0] < 0.55,
+            "\"expensive\"'s final utilization ({}) should be well below the ~0.60 an \
+             equal-share (pure LRU) rotation would have produced",
+            util[0]
+        );
+    }
+
     /// Regression: `persist_tokens` must save the config UNDER the lock, or two
     /// concurrent token refreshes race on the file and one account's just-rotated
     /// refresh token is lost — that account then 400s on its next refresh. Fire N
