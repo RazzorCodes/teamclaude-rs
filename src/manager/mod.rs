@@ -3568,6 +3568,92 @@ mod tests {
         );
     }
 
+    /// TCR-4: a per-account `switchThreshold` override takes precedence over the
+    /// global default in `Manager::eligible` — an account with a TIGHTER override
+    /// than the global default becomes ineligible at a utilization where a sibling
+    /// relying on the global default is still eligible.
+    #[test]
+    fn per_account_threshold_override_tightens_eligibility() {
+        let global_threshold = 0.90;
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let pacing = PacingConfig::default();
+
+        // Both accounts sit at 80% five-hour utilization: under the 0.90 global
+        // default, but AT/OVER a tighter 0.75 per-account override.
+        let util = window(0.80, None);
+
+        let mut tight = AccountRuntime::from_config(&account("tight", 0));
+        tight.switch_threshold = Some(0.75); // tighter than the 0.90 global default
+        tight.quota.five_hour = Some(util);
+
+        let mut default = AccountRuntime::from_config(&account("default", 0));
+        default.quota.five_hour = Some(util); // no override -> inherits 0.90
+
+        assert!(
+            !Manager::eligible(&tight, global_threshold, &pacing, true, now, now_ms, false),
+            "an account with a tighter override (0.75) must be ineligible at 80% \
+             utilization even though the global default (0.90) would still allow it"
+        );
+        assert!(
+            Manager::eligible(
+                &default,
+                global_threshold,
+                &pacing,
+                true,
+                now,
+                now_ms,
+                false
+            ),
+            "the sibling account with no override must still be eligible at 80% \
+             utilization under the 0.90 global default"
+        );
+    }
+
+    /// TCR-4 inverse: a LOOSER-than-global per-account override is also honoured
+    /// — the account keeps serving past the point the global default would have
+    /// excluded it. This is a legitimate use of the same knob (e.g. a subscription
+    /// with genuinely more headroom than the fleet default assumes), not just a
+    /// one-directional cap; `switch_threshold` is a plain `unwrap_or` substitution
+    /// with no clamping toward "tighter only".
+    #[test]
+    fn per_account_threshold_override_can_loosen_eligibility() {
+        let global_threshold = 0.90;
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let pacing = PacingConfig::default();
+
+        // 92% utilization: at/over the 0.90 global default, but under a looser
+        // 0.95 per-account override.
+        let util = window(0.92, None);
+
+        let mut loose = AccountRuntime::from_config(&account("loose", 0));
+        loose.switch_threshold = Some(0.95); // looser than the 0.90 global default
+        loose.quota.five_hour = Some(util);
+
+        let mut default = AccountRuntime::from_config(&account("default", 0));
+        default.quota.five_hour = Some(util); // no override -> inherits 0.90
+
+        assert!(
+            Manager::eligible(&loose, global_threshold, &pacing, true, now, now_ms, false),
+            "an account with a looser override (0.95) must remain eligible at 92% \
+             utilization even though the global default (0.90) would exclude it"
+        );
+        assert!(
+            !Manager::eligible(
+                &default,
+                global_threshold,
+                &pacing,
+                true,
+                now,
+                now_ms,
+                false
+            ),
+            "the sibling account with no override must be ineligible at 92% \
+             utilization under the 0.90 global default"
+        );
+    }
+
     /// #3 An account selected less than `min_spacing_ms` ago is skipped; once the
     /// window elapses it is eligible again. Tested at `eligible()` so the soft
     /// select() fallback can't mask the gate.

@@ -1593,6 +1593,49 @@ mod tests {
         );
     }
 
+    /// TCR-4: an account's own `switchThreshold` round-trips through
+    /// deserialize -> serialize -> deserialize byte-identically, and an account
+    /// that never set one keeps inheriting the global default rather than having
+    /// one materialized onto it by a save.
+    #[test]
+    fn per_account_switch_threshold_round_trips() {
+        let json = r#"{
+          "accounts": [
+            { "name": "tight", "type": "oauth", "accessToken": "at-tight", "switchThreshold": 0.5 },
+            { "name": "loose", "type": "oauth", "accessToken": "at-loose" }
+          ]
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.accounts[0].switch_threshold, Some(0.5));
+        assert_eq!(
+            config.accounts[1].switch_threshold, None,
+            "an account without its own switchThreshold must not silently inherit \
+             a materialized value at parse time — it stays None so selection logic \
+             falls back to the global default"
+        );
+
+        let tmp = tmp_path("switch-threshold-roundtrip");
+        save(&tmp, &config).unwrap();
+        let value = read_json(&tmp);
+
+        assert_eq!(value["accounts"][0]["switchThreshold"], json!(0.5));
+        // `skip_serializing_if = "Option::is_none"` means an unset override must
+        // not reappear on disk as a literal `null` (or any value) — the whole
+        // key must be absent, so an operator editing the file never sees a
+        // per-account override they did not write.
+        assert!(
+            value["accounts"][1].get("switchThreshold").is_none(),
+            "an unset per-account switchThreshold must not be written to disk at all: {:?}",
+            value["accounts"][1]
+        );
+
+        let reloaded: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(reloaded.accounts[0].switch_threshold, Some(0.5));
+        assert_eq!(reloaded.accounts[1].switch_threshold, None);
+
+        fs::remove_file(&tmp).ok();
+    }
+
     /// A unique temp path per test — the suite runs tests in parallel threads of
     /// ONE process, so a pid-only name collides.
     fn tmp_path(tag: &str) -> PathBuf {
