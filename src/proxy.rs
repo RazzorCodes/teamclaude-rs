@@ -10621,4 +10621,348 @@ mod tests {
             "an ordinary path still reaches the rotation loop (dead upstream → 502)"
         );
     }
+
+    // --- TCR-2: provider routing / dispatch / fallback ----------------------
+    //
+    // These are the gate scenarios from the TCR-2 plan: two-provider routing by
+    // model (with translation), 429 fallback, 401 no-cascade, and (proven above,
+    // by the WHOLE existing suite passing unmodified with the new Config fields
+    // defaulted to empty) the unconfigured/empty path being byte-identical.
+    mod provider_routing {
+        use super::*;
+        use crate::config::{ModelRoute, Provider, ProviderAuth};
+
+        /// One request an upstream received: its raw body text and headers,
+        /// lowercase-name-keyed. Enough to assert on model translation and on
+        /// the injected credential header without pulling in a JSON diff lib.
+        #[derive(Debug, Clone)]
+        struct RecordedProviderRequest {
+            body: String,
+            headers: Vec<(String, String)>,
+        }
+
+        /// A fake third-party provider upstream: answers every request with a
+        /// fixed status/body and records what it received. Deliberately
+        /// axum-based (like `spawn_echo_upstream`) rather than a raw scripted
+        /// TCP responder — these tests assert on the RECORDED request, not just
+        /// on the client-visible status, so the fake has to actually parse and
+        /// keep what came in.
+        async fn spawn_provider_upstream(
+            status: u16,
+            reply_body: &'static str,
+        ) -> (
+            String,
+            Arc<tokio::sync::Mutex<Vec<RecordedProviderRequest>>>,
+        ) {
+            let records: Arc<tokio::sync::Mutex<Vec<RecordedProviderRequest>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let recs = records.clone();
+            let router = Router::new().fallback(move |req: Request| {
+                let recs = recs.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let bytes = to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default();
+                    let headers = parts
+                        .headers
+                        .iter()
+                        .map(|(n, v)| {
+                            (n.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                        })
+                        .collect();
+                    recs.lock().await.push(RecordedProviderRequest {
+                        body: String::from_utf8_lossy(&bytes).to_string(),
+                        headers,
+                    });
+                    let mut resp = Response::new(Body::from(reply_body));
+                    *resp.status_mut() = StatusCode::from_u16(status).unwrap();
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    resp
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind provider upstream");
+            let addr = listener.local_addr().expect("provider upstream addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            (format!("http://{addr}"), records)
+        }
+
+        fn env_auth(var: &str) -> ProviderAuth {
+            ProviderAuth::Env {
+                var: var.to_string(),
+                header: None,
+                prefix: None,
+            }
+        }
+
+        fn provider(name: &str, base_url: &str, auth: ProviderAuth) -> Provider {
+            Provider {
+                name: name.to_string(),
+                base_url: base_url.to_string(),
+                auth,
+                models: vec![],
+                model_map: serde_json::Map::new(),
+                headers: serde_json::Map::new(),
+            }
+        }
+
+        fn route(model: &str, priority: i64, candidates: &[&str]) -> ModelRoute {
+            ModelRoute {
+                model: model.to_string(),
+                priority,
+                candidates: candidates.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        /// A config carrying `providers`/`model_routes` on top of `dummy_config`'s
+        /// single dummy fleet account. A `"fleet"` provider (`auth: fleet`) is
+        /// ALWAYS included and unreferenced by the test's routes: `from_config`
+        /// hard-errors a `model_routes[]` table with no fleet provider anywhere
+        /// in it (see `routing.rs`), by design — this is the config-level escape
+        /// hatch the hard-error exists to require, not a per-test workaround.
+        fn config_with_routes(providers: Vec<Provider>, model_routes: Vec<ModelRoute>) -> Config {
+            let mut config = dummy_config(None, "http://127.0.0.1:1");
+            let mut providers = providers;
+            providers.push(provider(
+                "fleet",
+                "https://unused.invalid",
+                ProviderAuth::Fleet,
+            ));
+            config.providers = providers;
+            config.model_routes = model_routes;
+            config
+        }
+
+        /// Minimal `/v1/messages`-shaped body targeting `model`.
+        fn body_for(model: &str) -> String {
+            serde_json::json!({ "model": model, "messages": [] }).to_string()
+        }
+
+        async fn post_messages(manager: Arc<Manager>, body: String) -> (StatusCode, Bytes) {
+            use tower::ServiceExt as _;
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("build request");
+            let response = app(manager).oneshot(req).await.expect("router response");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("read body");
+            (status, bytes)
+        }
+
+        /// Captures `tracing` output for the life of the guard, into a shared
+        /// buffer — enough to assert on the fallback/terminal log lines without
+        /// pulling in a new dependency (`tracing-subscriber` is already in the
+        /// tree for the binary's own logging). `#[tokio::test]` defaults to the
+        /// CURRENT-THREAD runtime, so a thread-local default subscriber set here
+        /// also covers every `tokio::spawn`ed task driven by the same test.
+        struct TracingCapture {
+            buf: Arc<std::sync::Mutex<Vec<u8>>>,
+            _guard: tracing::subscriber::DefaultGuard,
+        }
+
+        struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl TracingCapture {
+            fn new() -> Self {
+                let buf: Arc<std::sync::Mutex<Vec<u8>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                let for_writer = buf.clone();
+                // Satisfies tracing_subscriber's blanket `MakeWriter` impl for
+                // `Fn() -> W where W: io::Write` — no explicit trait needed.
+                let make_writer = move || CaptureWriter(for_writer.clone());
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(make_writer)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish();
+                let guard = tracing::subscriber::set_default(subscriber);
+                Self { buf, _guard: guard }
+            }
+
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.buf.lock().expect("capture lock poisoned"))
+                    .to_string()
+            }
+        }
+
+        // --- gate scenario 1: two-provider routing by model, with translation --
+
+        #[tokio::test]
+        async fn two_provider_routing_dispatches_by_model_and_translates_it() {
+            std::env::set_var("TCR2_TEST_ROUTING_VAR", "test-secret-b");
+            std::env::set_var("TCR2_TEST_ROUTING_VAR_A", "test-secret-a");
+            let (url_a, records_a) = spawn_provider_upstream(200, r#"{"ok":true}"#).await;
+            let (url_b, records_b) = spawn_provider_upstream(200, r#"{"ok":true}"#).await;
+
+            let mut provider_b = provider("b", &url_b, env_auth("TCR2_TEST_ROUTING_VAR"));
+            provider_b.model_map.insert(
+                "claude-sonnet-4-6".to_string(),
+                Value::String("b-native-model".to_string()),
+            );
+
+            let config = config_with_routes(
+                vec![
+                    provider("a", &url_a, env_auth("TCR2_TEST_ROUTING_VAR_A")),
+                    provider_b,
+                ],
+                vec![
+                    route("claude-opus-*", 0, &["a"]),
+                    route("claude-sonnet-*", 0, &["b"]),
+                ],
+            );
+            // `config_with_routes` already contributes the ONE `auth: fleet`
+            // provider every `model_routes[]` table needs (see its doc); "a"
+            // here is a second, ordinary third-party provider bound to a
+            // DIFFERENT route (`claude-opus-*`) that this test's sonnet request
+            // never matches, so its upstream must see NOTHING.
+            let manager = Manager::with_live_refresher(config, None);
+
+            let (status, _) = post_messages(manager, body_for("claude-sonnet-4-6")).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let seen_b = records_b.lock().await;
+            assert_eq!(
+                seen_b.len(),
+                1,
+                "provider b must have received exactly one request"
+            );
+            let v: Value = serde_json::from_str(&seen_b[0].body).unwrap();
+            assert_eq!(
+                v["model"], "b-native-model",
+                "the outbound body's model must be translated to b's native id"
+            );
+            assert!(
+                seen_b[0]
+                    .headers
+                    .iter()
+                    .any(|(n, v)| n == "authorization" && v == "Bearer test-secret-b"),
+                "provider b's credential header must be injected: {:?}",
+                seen_b[0].headers
+            );
+
+            let seen_a = records_a.lock().await;
+            assert_eq!(
+                seen_a.len(),
+                0,
+                "provider a's route was never matched — it must see nothing"
+            );
+
+            std::env::remove_var("TCR2_TEST_ROUTING_VAR");
+            std::env::remove_var("TCR2_TEST_ROUTING_VAR_A");
+        }
+
+        // --- gate scenario 2: 429 falls back to the next candidate -------------
+
+        #[tokio::test]
+        async fn quota_429_from_first_candidate_falls_back_to_the_second() {
+            std::env::set_var("TCR2_TEST_429_VAR_B", "secret-b");
+            std::env::set_var("TCR2_TEST_429_VAR_A", "secret-a");
+            let capture = TracingCapture::new();
+
+            let (url_b, records_b) =
+                spawn_provider_upstream(429, r#"{"error":"rate_limited"}"#).await;
+            let (url_a, records_a) = spawn_provider_upstream(200, r#"{"ok":true}"#).await;
+
+            let config = config_with_routes(
+                vec![
+                    provider("b", &url_b, env_auth("TCR2_TEST_429_VAR_B")),
+                    provider("a", &url_a, env_auth("TCR2_TEST_429_VAR_A")),
+                ],
+                vec![route("claude-sonnet-*", 0, &["b", "a"])],
+            );
+            let manager = Manager::with_live_refresher(config, None);
+
+            let (status, _) = post_messages(manager, body_for("claude-sonnet-4-6")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the client must see the FALLBACK's 200"
+            );
+
+            assert_eq!(records_b.lock().await.len(), 1, "b was tried once");
+            assert_eq!(
+                records_a.lock().await.len(),
+                1,
+                "a served the request after b's 429"
+            );
+
+            let log = capture.text();
+            assert!(
+                log.contains("provider hop failed")
+                    && log.contains("from_provider=b")
+                    && log.contains("to_provider=\"a\"")
+                    && log.contains("trigger=429"),
+                "expected a fallback log line naming both providers and the 429 trigger, got:\n{log}"
+            );
+
+            std::env::remove_var("TCR2_TEST_429_VAR_B");
+            std::env::remove_var("TCR2_TEST_429_VAR_A");
+        }
+
+        // --- gate scenario 3: 401 does NOT cascade ------------------------------
+
+        #[tokio::test]
+        async fn hard_401_from_first_candidate_does_not_cascade() {
+            std::env::set_var("TCR2_TEST_401_VAR_B", "secret-b");
+            std::env::set_var("TCR2_TEST_401_VAR_A", "secret-a");
+            let capture = TracingCapture::new();
+
+            let (url_b, records_b) =
+                spawn_provider_upstream(401, r#"{"error":"unauthorized"}"#).await;
+            let (url_a, records_a) = spawn_provider_upstream(200, r#"{"ok":true}"#).await;
+
+            let config = config_with_routes(
+                vec![
+                    provider("b", &url_b, env_auth("TCR2_TEST_401_VAR_B")),
+                    provider("a", &url_a, env_auth("TCR2_TEST_401_VAR_A")),
+                ],
+                vec![route("claude-sonnet-*", 0, &["b", "a"])],
+            );
+            let manager = Manager::with_live_refresher(config, None);
+
+            let (status, _) = post_messages(manager, body_for("claude-sonnet-4-6")).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "the client must see b's 401 verbatim"
+            );
+
+            assert_eq!(records_b.lock().await.len(), 1, "b was tried once");
+            // THE BITING ASSERTION: a must never have been contacted at all.
+            assert_eq!(
+                records_a.lock().await.len(),
+                0,
+                "a hard 401 must not cascade to the next candidate"
+            );
+
+            let log = capture.text();
+            assert!(
+                log.contains("NOT cascading"),
+                "expected the terminal-non-2xx log line proving the 401 did not cascade, got:\n{log}"
+            );
+
+            std::env::remove_var("TCR2_TEST_401_VAR_B");
+            std::env::remove_var("TCR2_TEST_401_VAR_A");
+        }
+    }
 }
