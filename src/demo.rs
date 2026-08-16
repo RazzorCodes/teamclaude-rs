@@ -68,6 +68,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         requests: 0,
         last_used_ms: None,
         last_selected_seq: 0,
+        rotation_vtime: 0.0,
         in_flight: 0,
         last_served_ms: 0,
         rate_limited_until_ms: None,

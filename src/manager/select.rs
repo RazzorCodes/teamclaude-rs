@@ -140,18 +140,51 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
 }
 
 impl Manager {
+    /// Floor on [`Self::rotation_weight`] (TCR-5): the smallest quota-headroom
+    /// weight a `rotation_vtime` step is ever computed against. Without a floor
+    /// an account reading exactly `max_utilization == 1.0` would divide by
+    /// zero; a floor also bounds how large a single pick's vtime step can be
+    /// (`1 / ROTATION_MIN_WEIGHT`), so one pick on a nearly-exhausted account
+    /// can never catapult it to the back of the rotation forever. `0.02` caps
+    /// a single step at 50x an equal-headroom step — big enough to matter,
+    /// small enough that a later reset (headroom back near `1.0`) still lets
+    /// the account catch back up within a handful of picks.
+    const ROTATION_MIN_WEIGHT: f64 = 0.02;
+
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
     ///
-    /// Within a priority tier we pick the **least-recently-selected** account
-    /// (lowest `last_selected_seq`; a never-selected account sorts first) so
-    /// consecutive requests fan out instead of hammering one account. Ordering by
-    /// quota headroom was rejected deliberately: a single request barely moves a
-    /// weekly bar, so "most headroom first" would deterministically pin one
-    /// account until its bar caught up — the exact overload this fixes. The
-    /// winner is stamped with the next monotonic tick *before returning*, so even
-    /// a burst of concurrent selects rotates (each sees the previous stamp). The
-    /// soonest weekly reset is the final cold-start tiebreak (all-unseen startup).
+    /// Within a priority tier we pick by ascending **weighted-rotation virtual
+    /// time** (`rotation_vtime`; a never-selected account, at `0.0`, sorts
+    /// first) — see [`Self::pick_eligible`]'s doc-comment for the full design
+    /// (TCR-5). In short: this is LRU/round-robin where the "cost" of a pick is
+    /// scaled by how little headroom the account has left, so an account
+    /// burning through its quota window faster than its siblings — e.g. a run
+    /// of expensive requests — accrues virtual time faster and is throttled
+    /// back proportionally, CONTINUOUSLY, for as long as the imbalance
+    /// persists — not just at a one-time recency tie. When every account's
+    /// headroom is similar this degenerates to plain LRU (equal steps ⇒ the
+    /// same rotation order as before this feature). Ordering SOLELY by quota
+    /// headroom (ignoring recency entirely) was rejected deliberately: a
+    /// single request barely moves a weekly bar, so "most headroom first"
+    /// would deterministically pin one account until its bar caught up — the
+    /// exact overload this fixes. The winner is stamped with the next
+    /// monotonic tick and its rotation-vtime step *before returning*, so even
+    /// a burst of concurrent selects rotates (each sees the previous stamp).
+    /// The soonest weekly reset is the final cold-start tiebreak (all-unseen
+    /// startup, all headroom equal too).
+    ///
+    /// A FIRST cut of this feature (still TCR-5) placed headroom strictly
+    /// AFTER `last_selected_seq` in the sort key, so it only ever broke a
+    /// literal recency TIE. That shipped, then review traced through actual
+    /// runtime behaviour and found it dead weight in steady state:
+    /// `last_selected_seq` is a fleet-wide monotonic counter, so once every
+    /// account in a tier has been picked once, no two accounts can tie again
+    /// for the rest of that process's uptime — the bias only ever fired in the
+    /// brief window right after a restart, which is not the scenario TCR-5 was
+    /// filed for. `rotation_vtime` replaces it: see [`Self::pick_eligible`]'s
+    /// doc-comment for why a "bucket recency into coarse laps" alternative was
+    /// tried and rejected before landing on virtual time.
     ///
     /// This mutates rotation state (the stamp), so it takes the write lock.
     ///
@@ -441,8 +474,9 @@ impl Manager {
                                     .get(idx)
                                     .map(|a| a.quota.max_utilization(now, is_fable))
                                     .unwrap_or_default();
+                                let weight = (1.0 - util).max(Self::ROTATION_MIN_WEIGHT);
                                 if let Some(account) = accounts.get_mut(idx) {
-                                    account.last_selected_seq = tick;
+                                    Self::stamp_rotation(account, tick, weight);
                                     tracing::info!(
                                         account = %account.name,
                                         utilization = util,
@@ -513,8 +547,11 @@ impl Manager {
                             // Stamp the chosen account so a second session's LRU steers
                             // away from an account already busy under a pin.
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                            let weight = accounts
+                                .get(target)
+                                .map_or(1.0, |a| Self::rotation_weight(a, now, is_fable));
                             if let Some(account) = accounts.get_mut(target) {
-                                account.last_selected_seq = tick;
+                                Self::stamp_rotation(account, tick, weight);
                             }
                             Some((target, migrate_names))
                         }
@@ -780,8 +817,11 @@ impl Manager {
             // Stamp the chosen account so the next select prefers a different one.
             if let Some(idx) = best {
                 let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                let weight = accounts
+                    .get(idx)
+                    .map_or(1.0, |a| Self::rotation_weight(a, now, is_fable));
                 if let Some(account) = accounts.get_mut(idx) {
-                    account.last_selected_seq = tick;
+                    Self::stamp_rotation(account, tick, weight);
                 }
             }
             best
@@ -984,8 +1024,9 @@ impl Manager {
                         .get(idx)
                         .map(|a| a.quota.max_utilization(now, is_fable))
                         .unwrap_or_default();
+                    let weight = (1.0 - util).max(Self::ROTATION_MIN_WEIGHT);
                     if let Some(account) = accounts.get_mut(idx) {
-                        account.last_selected_seq = tick;
+                        Self::stamp_rotation(account, tick, weight);
                         tracing::info!(
                             account = %account.name,
                             utilization = util,
@@ -1101,8 +1142,9 @@ impl Manager {
                 .get(idx)
                 .map(|a| a.quota.max_utilization(now, is_fable))
                 .unwrap_or_default();
+            let weight = (1.0 - util).max(Self::ROTATION_MIN_WEIGHT);
             if let Some(account) = accounts.get_mut(idx) {
-                account.last_selected_seq = tick;
+                Self::stamp_rotation(account, tick, weight);
                 if via_sticky {
                     tracing::info!(
                         account = %account.name,
@@ -1565,12 +1607,6 @@ impl Manager {
             .unwrap_or((GateReason::Ok, None))
     }
 
-    /// The best pacing-respecting eligible account not in `tried`, by ascending
-    /// `(priority, last_selected_seq, soonest weekly reset)` — the pre-pacing LRU
-    /// order, now additionally skipping any account the soft pacing gate holds out.
-    /// Read-only (no stamp); the caller stamps the winner. Emits one INFO line per
-    /// account skipped *specifically because of pacing* (healthy but capped/spaced)
-    /// so the knobs are tunable live.
     /// The GENERAL pick's extra narrowing of the control account (§3): `true`
     /// for every account that is not the control account (a no-op), and for the
     /// control account itself, `true` only while its utilization stays under
@@ -1594,6 +1630,55 @@ impl Manager {
         !account.quota.is_near(reserved, now)
     }
 
+    /// The best pacing-respecting eligible account not in `tried`, by ascending
+    /// `(priority, rotation_vtime, utilization, soonest weekly reset)` — weighted
+    /// LRU rotation (TCR-5), still skipping any account the soft pacing gate
+    /// holds out. Read-only (no stamp); the caller stamps the winner via
+    /// [`Self::stamp_rotation`]. Emits one INFO line per account skipped
+    /// *specifically because of pacing* (healthy but capped/spaced) so the
+    /// knobs are tunable live.
+    ///
+    /// # Quota-headroom bias (TCR-5)
+    ///
+    /// This module's top-level doc-comment explains why headroom is not
+    /// allowed to outrank recency outright: a single request barely moves a
+    /// weekly quota bar, so "most headroom first" would deterministically pin
+    /// one account until its bar caught up with its siblings — recreating the
+    /// exact overload rotation exists to prevent, and defeating the natural
+    /// spread that keeps prompt-cache affinity working.
+    ///
+    /// The sort key's second field is `rotation_vtime`, not `last_selected_seq`.
+    /// Both start every account at the same value and both advance only when
+    /// that account is picked (see [`Self::stamp_rotation`]), so with EQUAL
+    /// headroom the two are interchangeable and this degenerates to plain LRU.
+    /// They diverge exactly when headroom diverges: `last_selected_seq` always
+    /// advances by exactly `1` per pick (recency is the only thing it can
+    /// track), while `rotation_vtime` advances by `1 / headroom` — a pick on an
+    /// account with little headroom left costs it MORE virtual time than the
+    /// same pick would cost a roomier sibling. The account that is burning
+    /// through its window fastest therefore climbs the sort key fastest and
+    /// drops toward the back of the rotation fastest, self-correcting the
+    /// imbalance for as long as it persists — a live, continuous effect, not
+    /// one that only fires at a cold-start tie.
+    ///
+    /// Two earlier designs were tried and rejected:
+    ///  - **Headroom strictly after `last_selected_seq`** (literal-tie-only):
+    ///    shipped first, then a review found it dead weight in steady state —
+    ///    `last_selected_seq` is a fleet-wide monotonic counter, so once every
+    ///    account in a tier has been picked once, no two accounts can ever tie
+    ///    again for the rest of that process's uptime. The bias only fired in
+    ///    the brief window right after a restart.
+    ///  - **Bucketing `last_selected_seq` into coarse laps**, letting headroom
+    ///    decide within a lap: because only the account just picked advances
+    ///    its own counter (unpicked siblings sit still), a favored high-headroom
+    ///    account stays inside a multi-tick-wide lap across several consecutive
+    ///    selects and gets re-picked every time — reproducing the exact pinning
+    ///    pattern this file's design already rejects, just at a smaller scale.
+    ///    `rotation_vtime` does not have that failure mode: the WINNER's own
+    ///    counter always jumps ahead of its still-competitive siblings by a
+    ///    step proportional to how little headroom it has left, so it cannot
+    ///    win two picks in a row against an equally-eligible sibling merely by
+    ///    sitting inside a shared bucket.
     fn pick_eligible(
         &self,
         accounts: &[AccountRuntime],
@@ -1604,7 +1689,7 @@ impl Manager {
         respect_pacing: bool,
     ) -> Option<usize> {
         let mut best: Option<usize> = None;
-        let mut best_key: Option<(i64, u64, i128)> = None;
+        let mut best_key: Option<(i64, u64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
             if tried.contains(&idx) {
                 continue;
@@ -1648,13 +1733,44 @@ impl Manager {
                 .quota
                 .governing_weekly_reset(now)
                 .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
-            let key = (account.priority, account.last_selected_seq, reset);
+            // Ascending bit-pattern order on a finite non-negative float (NaN/inf
+            // utilization headers are filtered at parse; `rotation_vtime` only
+            // ever accumulates finite positive steps, see `stamp_rotation`)
+            // matches ascending numeric order. Same trick already used by
+            // `select_revalidation`'s utilization sort.
+            let utilization_bits = account.quota.max_utilization(now, is_fable).to_bits();
+            let vtime_bits = account.rotation_vtime.to_bits();
+            let key = (account.priority, vtime_bits, utilization_bits, reset);
             if best_key.is_none_or(|b| key < b) {
                 best = Some(idx);
                 best_key = Some(key);
             }
         }
         best
+    }
+
+    /// Quota headroom used as `rotation_vtime`'s step weight (TCR-5): `1 -
+    /// max_utilization`, floored at [`Self::ROTATION_MIN_WEIGHT`] so an
+    /// eligible-but-nearly-exhausted account still accrues a bounded (not
+    /// infinite or NaN) virtual-time step, and a genuinely zero-headroom
+    /// reading can never divide by zero.
+    fn rotation_weight(account: &AccountRuntime, now: OffsetDateTime, is_fable: bool) -> f64 {
+        (1.0 - account.quota.max_utilization(now, is_fable)).max(Self::ROTATION_MIN_WEIGHT)
+    }
+
+    /// Stamp `account` as picked at select tick `tick` (TCR-5): advances BOTH
+    /// the plain recency counter `last_selected_seq` (still read by
+    /// [`Self::pick_least_loaded`] and the affinity-migration candidate scoring
+    /// above) and the weighted-rotation virtual time `rotation_vtime` that
+    /// [`Self::pick_eligible`] sorts by. Every stamp site in `select` and
+    /// `select_revalidation` funnels through here so the two counters never
+    /// drift apart — a pin-honored or migrated pick is a real pick of real
+    /// capacity and must cost the same rotation credit as one `pick_eligible`
+    /// chose directly, or a session pinned outside the normal pick path would
+    /// look artificially rested to it.
+    fn stamp_rotation(account: &mut AccountRuntime, tick: u64, weight: f64) {
+        account.last_selected_seq = tick;
+        account.rotation_vtime += 1.0 / weight;
     }
 
     /// The least-loaded servable account not in `tried`, IGNORING pacing (the soft

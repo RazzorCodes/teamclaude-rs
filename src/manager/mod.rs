@@ -298,6 +298,18 @@ pub struct AccountRuntime {
     /// makes the spread clock-granularity-independent: a burst of selects in the
     /// same millisecond still fans out, because each pick takes the next tick.
     pub last_selected_seq: u64,
+    /// Weighted-rotation virtual time (TCR-5): advances every time this account is
+    /// picked, by `1 / weight` where `weight` is this account's quota headroom
+    /// (`1 - max_utilization`) AT THE MOMENT OF THE PICK, floored so it never
+    /// divides by zero. Unlike `last_selected_seq` (a plain fleet-wide tick, same
+    /// cost regardless of the account's quota state), an account with LESS
+    /// headroom pays a BIGGER virtual-time step per pick — so
+    /// [`Manager::pick_eligible`] sorting ascending by this field naturally
+    /// favours roomier siblings *continuously*, not just at a one-time recency
+    /// tie. Starts at `0.0` (never-selected sorts first, same as `last_selected_seq`
+    /// used to). See `select.rs`'s module doc-comment for the full design
+    /// rationale and why this replaced a literal-tie headroom tiebreak.
+    pub rotation_vtime: f64,
     /// Requests currently being served on this account. Incremented when the proxy
     /// picks this account to forward a request and decremented on completion via
     /// the RAII [`InFlightGuard`] (every drop path — success, rotate, error, panic).
@@ -555,6 +567,7 @@ impl AccountRuntime {
             requests: 0,
             last_used_ms: None,
             last_selected_seq: 0,
+            rotation_vtime: 0.0,
             in_flight: 0,
             last_served_ms: 0,
             rate_limited_until_ms: None,
