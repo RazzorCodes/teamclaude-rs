@@ -156,6 +156,14 @@ const OFFLINE_WAIT_SECS: u64 = 2;
 /// recoverable and usually short — measured 2026-08-10, DNS was back within
 /// seconds of each full wake — so this is a nudge to come back, not a park.
 const OFFLINE_RETRY_AFTER_SECS: i64 = 5;
+/// Bound on how many TCR-2 provider candidates one request may walk before
+/// giving up and forwarding the last response verbatim. Separate from
+/// [`max_attempts_for`]: the provider walk runs in its own pre-loop BEFORE the
+/// existing fleet rotation loop even starts (see the `dispatch_provider_route`
+/// call site in [`handle`]), so it does not compete with that loop's attempt
+/// budget — it has its own, sized to the longest sane candidate ladder rather
+/// than the fleet's account count.
+const MAX_PROVIDER_HOPS: usize = 8;
 
 /// Backoff (seconds) before the `retried`-th in-place retry of a `529 Overloaded`.
 ///
@@ -255,6 +263,77 @@ fn classify_transient_429(retry_after: Option<i64>, retried: u32, jitter: i64) -
         }
         None => Transient429::Park(NO_GUIDANCE_HOLD_SECS + jitter),
     }
+}
+
+/// What a TCR-2 provider hop's outcome means for the candidate walk in
+/// [`dispatch_provider_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopVerdict {
+    /// Move to the next candidate for this trigger.
+    Advance(HopTrigger),
+    /// Forward this outcome to the client and stop walking — either a real
+    /// success (2xx/3xx) or a hard failure that would fail identically on
+    /// every other candidate.
+    Terminal,
+}
+
+/// Why a provider hop advanced to the next candidate — logged on every fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopTrigger {
+    Quota429,
+    Upstream5xx,
+    Timeout,
+    Transport,
+}
+
+impl std::fmt::Display for HopTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HopTrigger::Quota429 => "429",
+            HopTrigger::Upstream5xx => "5xx",
+            HopTrigger::Timeout => "timeout",
+            HopTrigger::Transport => "transport",
+        })
+    }
+}
+
+/// Classify a TCR-2 provider hop's outcome as retryable-on-the-next-candidate
+/// vs terminal. Exactly one of `status`/`err` is `Some` — the caller passes the
+/// HTTP status on a completed send, or the transport error on a failed one.
+///
+/// 429/5xx/timeout/transport all [`HopVerdict::Advance`]: a candidate that is
+/// over quota, down, or unreachable tells us nothing about whether the NEXT
+/// candidate can serve the request.
+///
+/// 401/403/400 and every other 4xx are [`HopVerdict::Terminal`] — load-bearing,
+/// tested behavior, NOT an oversight: a bad credential or a malformed request
+/// fails identically on the next provider (a stale API key is still stale, a
+/// request Anthropic rejects as malformed is exactly as malformed to a
+/// second vendor's translation layer). Cascading a hard error burns the
+/// fallback budget for no chance of a different outcome, and — worse — hands
+/// the SAME broken/unauthorized request to a second third-party vendor, which
+/// is a data-handling decision the operator did not ask for.
+fn classify_provider_failure(
+    status: Option<StatusCode>,
+    err: Option<&reqwest::Error>,
+) -> HopVerdict {
+    if let Some(status) = status {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return HopVerdict::Advance(HopTrigger::Quota429);
+        }
+        if status.is_server_error() {
+            return HopVerdict::Advance(HopTrigger::Upstream5xx);
+        }
+        return HopVerdict::Terminal;
+    }
+    if let Some(err) = err {
+        return if err.is_timeout() {
+            HopVerdict::Advance(HopTrigger::Timeout)
+        } else {
+            HopVerdict::Advance(HopTrigger::Transport)
+        };
+    }
+    HopVerdict::Terminal
 }
 
 /// Decide whether an all-accounts-unavailable state is a *transient* fleet-park
@@ -1931,6 +2010,42 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         .as_deref()
         .is_some_and(crate::model::is_fable_model);
 
+    // 2b. TCR-2 provider routing. A NEW layer, entirely separate from the fleet
+    //     rotation loop below: `candidates_for` answers "which upstream
+    //     provider(s), in what order" for THIS request's model, purely from the
+    //     boot-built [`crate::routing::RoutingTable`] — no lock, no network, no
+    //     account-pool state touched. An unmatched model (or an unconfigured
+    //     proxy, where the table is fully inert) returns an EMPTY route, and
+    //     this block does nothing: the fleet loop below runs exactly as it did
+    //     before TCR-2 existed, which is what keeps an unconfigured proxy
+    //     byte-identical.
+    //
+    //     Walks the matched route's candidates in DECLARED order. A `Fleet`
+    //     candidate (explicit in the table, not a special case here) is not
+    //     dispatched by this block at all — reaching one means "hand this
+    //     request to the existing pooled-account path", so the walk stops and
+    //     falls through to the fleet loop unchanged. Only when every candidate
+    //     BEFORE a `Fleet` one (or before the list runs out, with no `Fleet` at
+    //     all) is a genuine third-party miss does this function return a
+    //     terminal `Response` directly — a real success, or a hard error that
+    //     must not cascade (see [`classify_provider_failure`]).
+    let route = manager.routing().candidates_for(request_model.as_deref());
+    if !route.is_empty() {
+        match dispatch_provider_route(
+            &manager,
+            &route,
+            &method,
+            &path_and_query,
+            &req_headers,
+            &body_bytes,
+        )
+        .await
+        {
+            Some(resp) => return resp,
+            None => { /* walk reached a Fleet candidate — fall through below */ }
+        }
+    }
+
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
     // rotation) by default. When on, key on the most STABLE client identity —
@@ -2894,6 +3009,215 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     }
 }
 
+/// Walk a TCR-2 [`crate::routing::Route`]'s candidates in order, dispatching each
+/// third-party one directly (bypassing `manager.select`/account-token logic
+/// entirely — none of it applies to a provider credential) and falling back on
+/// [`classify_provider_failure`]'s verdict.
+///
+/// Returns `Some(response)` for every TERMINAL outcome this function reaches on
+/// its own: a genuine success/forwarded-error from a third-party provider, or
+/// exhaustion of the candidate list with no `Fleet` candidate anywhere in it.
+/// Returns `None` the moment the walk reaches a `Fleet` candidate — the caller
+/// (`handle`) then falls through into the existing, UNCHANGED fleet rotation
+/// loop, which is the only thing that may ever touch `manager.select`.
+///
+/// Bounded by [`MAX_PROVIDER_HOPS`], independent of the fleet loop's own
+/// `max_attempts_for` budget (see the constant's doc) — this function runs
+/// entirely BEFORE that loop starts, so the two can never compete for the same
+/// attempt budget.
+async fn dispatch_provider_route(
+    manager: &Manager,
+    route: &crate::routing::Route<'_>,
+    method: &Method,
+    path_and_query: &str,
+    req_headers: &HeaderMap,
+    body_bytes: &Bytes,
+) -> Option<Response> {
+    let http = manager.http_client();
+    let (matched_glob, matched_priority) = route.matched().unwrap_or(("*", 0));
+    let requested_model = crate::model::parse_request_model(body_bytes);
+    let max_hops = route.len().min(MAX_PROVIDER_HOPS);
+    let mut last_response: Option<Response> = None;
+
+    for hop in 0..max_hops {
+        let Some(provider) = route.get(hop) else {
+            break;
+        };
+        if provider.is_fleet() {
+            tracing::info!(
+                hop,
+                provider = %provider.name,
+                matched_glob,
+                matched_priority,
+                "provider routing reached the fleet candidate — falling through to pooled-account dispatch"
+            );
+            return None;
+        }
+
+        let translated_model = requested_model
+            .as_deref()
+            .map(|m| provider.translate_model(m).to_string());
+        let out_body: bytes::Bytes = match &translated_model {
+            Some(new_id) => match crate::routing::patch_model(body_bytes, new_id) {
+                std::borrow::Cow::Owned(v) => v.into(),
+                std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
+            },
+            None => body_bytes.clone(),
+        };
+
+        tracing::info!(
+            hop,
+            provider = %provider.name,
+            matched_glob,
+            matched_priority,
+            requested_model = requested_model.as_deref().unwrap_or("<none>"),
+            translated_model = translated_model.as_deref().unwrap_or("<unchanged>"),
+            "dispatching to provider"
+        );
+
+        let url = format!("{}{}", provider.base_url, path_and_query);
+        let mut builder = http
+            .request(method.clone(), &url)
+            .headers(build_provider_headers(req_headers, provider));
+        if *method != Method::GET && *method != Method::HEAD {
+            builder = builder.body(out_body);
+        }
+
+        let send_result = builder.send().await;
+        let (status, verdict) = match &send_result {
+            Ok(resp) => {
+                let status = resp.status();
+                (Some(status), classify_provider_failure(Some(status), None))
+            }
+            Err(err) => (None, classify_provider_failure(None, Some(err))),
+        };
+
+        match verdict {
+            HopVerdict::Advance(trigger) => {
+                let to_provider = route
+                    .get(hop + 1)
+                    .map_or("<exhausted>", |p| p.name.as_str());
+                tracing::warn!(
+                    hop,
+                    from_provider = %provider.name,
+                    to_provider,
+                    trigger = %trigger,
+                    status = status.map(|s| s.as_u16()),
+                    max_hops,
+                    "provider hop failed — advancing to the next candidate"
+                );
+                // Stash the response so a fully-exhausted walk with no Fleet
+                // candidate has something honest to forward rather than a
+                // synthesized error (mirrors the fleet loop's own
+                // `bad_gateway`/`exhausted_response` split).
+                if let Ok(resp) = send_result {
+                    last_response = Some(provider_response(resp, req_headers).await);
+                }
+                continue;
+            }
+            HopVerdict::Terminal => {
+                let resp = match send_result {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        // classify_provider_failure only returns Terminal for
+                        // Err when both status and err are None, which cannot
+                        // happen here (err is Some) — defensive fallback only.
+                        tracing::error!(hop, provider = %provider.name, error = ?err, "unexpected transport error classified as terminal");
+                        return Some(error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "proxy_error",
+                            "Provider request failed.",
+                            None,
+                        ));
+                    }
+                };
+                let status = resp.status();
+                if !status.is_success() && !status.is_redirection() {
+                    // This is the line that proves the 401-no-cascade behavior
+                    // is observable: a hard 4xx from THIS provider is forwarded
+                    // to the client and the walk stops HERE — the remaining
+                    // candidates (if any) are never contacted.
+                    tracing::info!(
+                        hop,
+                        provider = %provider.name,
+                        status = status.as_u16(),
+                        remaining_candidates = route.len().saturating_sub(hop + 1),
+                        "provider hop terminal (non-2xx, not a retryable status) — NOT cascading to the next candidate"
+                    );
+                } else {
+                    tracing::info!(
+                        hop,
+                        provider = %provider.name,
+                        status = status.as_u16(),
+                        "provider hop served the request"
+                    );
+                }
+                return Some(provider_response(resp, req_headers).await);
+            }
+        }
+    }
+
+    tracing::warn!(
+        hops = max_hops,
+        matched_glob,
+        matched_priority,
+        "provider routing exhausted every candidate with no fleet fallback in the route — forwarding the last response"
+    );
+    Some(last_response.unwrap_or_else(|| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "proxy_error",
+            "Every configured provider candidate failed and none is a fleet fallback.",
+            None,
+        )
+    }))
+}
+
+/// Assemble the client response for a TCR-2 provider hop: stream SSE bodies
+/// through untouched (mirrors the fleet path's tee, minus the account-indexed
+/// usage bookkeeping — a provider response is never charged against any
+/// pooled account's quota), buffer everything else under the same cap as the
+/// fleet path.
+///
+/// Deliberately does NOT call `manager.record_served` / `manager.push_log` /
+/// `manager.update_usage` / any other account-indexed bookkeeping — those are
+/// keyed by fleet account index and must never fire for a third-party
+/// response (see the `handle` doc on why the two paths stay disjoint).
+/// [`ServedBy::Caller`] keeps every upstream header intact: a third-party
+/// provider is a fixed, named target (not a rotating pooled account), so
+/// there is no "different identity every request" reason to strip anything.
+async fn provider_response(resp: reqwest::Response, _req_headers: &HeaderMap) -> Response {
+    let status = resp.status();
+    let up_headers = resp.headers().clone();
+    let is_stream = up_headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"));
+    if is_stream {
+        return build_response(
+            status,
+            &up_headers,
+            Body::from_stream(resp.bytes_stream()),
+            ServedBy::Caller,
+        );
+    }
+    match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
+        Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
+        Err(BodyReadError::Transport) => error_response(
+            StatusCode::BAD_GATEWAY,
+            "proxy_error",
+            "Failed to read upstream response body.",
+            None,
+        ),
+        Err(BodyReadError::TooLarge) => error_response(
+            StatusCode::BAD_GATEWAY,
+            "proxy_error",
+            "Upstream response body exceeded the size cap.",
+            None,
+        ),
+    }
+}
+
 /// Length-independent comparison of the presented key against the configured
 /// one. It never returns early on a length mismatch, so the loop count depends
 /// only on the *presented* key's length (attacker-controlled) and never reveals
@@ -2965,6 +3289,39 @@ fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
     }
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
         out.insert(AUTHORIZATION, value);
+    }
+    out
+}
+
+/// Sibling of [`build_upstream_headers`] for a TCR-2 third-party provider hop:
+/// same hop-by-hop/auth/encoding strip (including `content-length` — the body
+/// may have been re-serialized by [`crate::routing::patch_model`], which is
+/// not generally same-length, so a stale length must never survive to let the
+/// HTTP client recompute it from the real outbound body), but injects the
+/// PROVIDER's configured credential header instead of a pooled Bearer, plus
+/// its additive vendor headers.
+fn build_provider_headers(
+    req_headers: &HeaderMap,
+    provider: &crate::routing::ResolvedProvider,
+) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in req_headers.iter() {
+        let lower = name.as_str();
+        if lower.starts_with(':')
+            || is_request_hop_by_hop(lower)
+            || lower == "x-api-key"
+            || lower == "authorization"
+            || lower == "accept-encoding"
+        {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    if let crate::routing::Credential::Header { name, value } = &provider.credential {
+        out.insert(name.clone(), value.clone());
+    }
+    for (name, value) in &provider.extra_headers {
+        out.insert(name.clone(), value.clone());
     }
     out
 }
