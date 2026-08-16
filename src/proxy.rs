@@ -2038,6 +2038,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             &path_and_query,
             &req_headers,
             &body_bytes,
+            0,
         )
         .await
         {
@@ -2045,6 +2046,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             None => { /* walk reached a Fleet candidate — fall through below */ }
         }
     }
+    // TCR-7: the hop immediately after the route's `Fleet` candidate, if any —
+    // where the fleet loop below resumes the SAME walk once it exhausts every
+    // pooled account, instead of dead-ending in `exhausted_response`. `None`
+    // when the route is empty (today's default/no-config shape) or has no
+    // `Fleet` candidate at all (the walk above would have already returned a
+    // terminal response in that case, never falling through here) — either
+    // way, `resume_provider_fallback` below is then a guaranteed no-op and
+    // the fleet loop's exhaustion behavior is byte-identical to before TCR-7.
+    let fleet_resume_hop: Option<usize> = route.fleet_hop().map(|h| h + 1);
 
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
@@ -2285,6 +2295,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     session_key,
                                 ) {
                                     idx
+                                } else if let Some(resp) = resume_provider_fallback(
+                                    &manager,
+                                    &route,
+                                    fleet_resume_hop,
+                                    &method,
+                                    &path_and_query,
+                                    &req_headers,
+                                    &body_bytes,
+                                )
+                                .await
+                                {
+                                    return resp;
                                 } else {
                                     return exhausted_response(
                                         &manager,
@@ -2293,6 +2315,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                         request_is_fable,
                                     );
                                 }
+                            } else if let Some(resp) = resume_provider_fallback(
+                                &manager,
+                                &route,
+                                fleet_resume_hop,
+                                &method,
+                                &path_and_query,
+                                &req_headers,
+                                &body_bytes,
+                            )
+                            .await
+                            {
+                                return resp;
                             } else {
                                 return exhausted_response(
                                     &manager,
@@ -2999,6 +3033,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // otherwise an upstream did answer us and the honest verdict is exhausted quota.
     if every_attempt_transport_failed(transport_failures, upstream_responses) {
         bad_gateway(transport_failures)
+    } else if let Some(resp) = resume_provider_fallback(
+        &manager,
+        &route,
+        fleet_resume_hop,
+        &method,
+        &path_and_query,
+        &req_headers,
+        &body_bytes,
+    )
+    .await
+    {
+        resp
     } else {
         exhausted_response(
             &manager,
@@ -3017,14 +3063,20 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 /// Returns `Some(response)` for every TERMINAL outcome this function reaches on
 /// its own: a genuine success/forwarded-error from a third-party provider, or
 /// exhaustion of the candidate list with no `Fleet` candidate anywhere in it.
-/// Returns `None` the moment the walk reaches a `Fleet` candidate — the caller
-/// (`handle`) then falls through into the existing, UNCHANGED fleet rotation
-/// loop, which is the only thing that may ever touch `manager.select`.
+/// Returns `None` the moment the walk reaches a `Fleet` candidate — for a
+/// `start_hop` of 0 (TCR-2's original pre-loop call site), the caller
+/// (`handle`) falls through into the existing fleet rotation loop, which is
+/// the only thing that may ever touch `manager.select`. TCR-7 adds a SECOND
+/// call site: once the fleet loop itself is exhausted, `handle` calls back in
+/// here with `start_hop` set to one past the route's `Fleet` hop (see
+/// [`crate::routing::Route::fleet_hop`]) to give any candidates declared
+/// AFTER `Fleet` a chance to serve as overflow, reusing this exact hop loop
+/// rather than duplicating it.
 ///
 /// Bounded by [`MAX_PROVIDER_HOPS`], independent of the fleet loop's own
-/// `max_attempts_for` budget (see the constant's doc) — this function runs
-/// entirely BEFORE that loop starts, so the two can never compete for the same
-/// attempt budget.
+/// `max_attempts_for` budget (see the constant's doc) — the pre-loop call
+/// runs entirely BEFORE that loop starts and the resume call runs entirely
+/// AFTER it ends, so the two can never compete for the same attempt budget.
 async fn dispatch_provider_route(
     manager: &Manager,
     route: &crate::routing::Route<'_>,
@@ -3032,14 +3084,24 @@ async fn dispatch_provider_route(
     path_and_query: &str,
     req_headers: &HeaderMap,
     body_bytes: &Bytes,
+    start_hop: usize,
 ) -> Option<Response> {
     let http = manager.http_client();
     let (matched_glob, matched_priority) = route.matched().unwrap_or(("*", 0));
     let requested_model = crate::model::parse_request_model(body_bytes);
     let max_hops = route.len().min(MAX_PROVIDER_HOPS);
+    if start_hop >= max_hops {
+        // Nothing left to walk — either the route ended right after the
+        // `Fleet` hop (today's default/no-config shape, unchanged) or the
+        // resume point fell outside the hop budget. Either way this is "no
+        // fallback available", not "every fallback failed": returning `None`
+        // here (rather than a synthesized error) is what keeps an exhausted
+        // fleet with nothing configured after it byte-identical to a 429.
+        return None;
+    }
     let mut last_response: Option<Response> = None;
 
-    for hop in 0..max_hops {
+    for hop in start_hop..max_hops {
         let Some(provider) = route.get(hop) else {
             break;
         };
@@ -3165,6 +3227,7 @@ async fn dispatch_provider_route(
     }
 
     tracing::warn!(
+        start_hop,
         hops = max_hops,
         matched_glob,
         matched_priority,
@@ -3178,6 +3241,42 @@ async fn dispatch_provider_route(
             None,
         )
     }))
+}
+
+/// TCR-7: called at each of the fleet loop's exhaustion points instead of
+/// going straight to `exhausted_response`. `fleet_resume_hop` is
+/// `route.fleet_hop().map(|h| h + 1)`, computed once up front in `handle`
+/// (see the comment there) — `None` means the route had no `Fleet` candidate
+/// to resume past (including the empty-route default case), so this is a
+/// guaranteed no-op and the caller's existing 429 is unchanged.
+///
+/// Deliberately takes `&Manager` rather than reusing any fleet-loop-local
+/// state: everything the resumed walk touches (the HTTP client, the provider
+/// dispatch timeout, the routing table) is already immutable/shared, and
+/// [`dispatch_provider_route`] itself never touches account-indexed
+/// bookkeeping (`update_quota`/`mark_rate_limited`/`record_served`/
+/// `update_usage`) — there is no account index once the fleet is exhausted,
+/// and this function does not introduce one.
+async fn resume_provider_fallback(
+    manager: &Manager,
+    route: &crate::routing::Route<'_>,
+    fleet_resume_hop: Option<usize>,
+    method: &Method,
+    path_and_query: &str,
+    req_headers: &HeaderMap,
+    body_bytes: &Bytes,
+) -> Option<Response> {
+    let resume_hop = fleet_resume_hop?;
+    dispatch_provider_route(
+        manager,
+        route,
+        method,
+        path_and_query,
+        req_headers,
+        body_bytes,
+        resume_hop,
+    )
+    .await
 }
 
 /// Assemble the client response for a TCR-2 provider hop: stream SSE bodies

@@ -135,6 +135,16 @@ impl<'a> Route<'a> {
     pub fn matched(&self) -> Option<(&'a str, i64)> {
         self.matched
     }
+
+    /// Index of the (at most one — `from_config` hard-errors a table with more
+    /// than one) `Fleet` candidate in this route, if any. TCR-7's
+    /// fleet-exhaustion resume uses `fleet_hop() + 1` as the hop to resume
+    /// [`dispatch_provider_route`] from once the pooled-account fleet is
+    /// exhausted, so any candidates declared AFTER `Fleet` in the route get a
+    /// chance to serve instead of the request dead-ending in a 429.
+    pub fn fleet_hop(&self) -> Option<usize> {
+        (0..self.candidates.len()).find(|&i| self.get(i).is_some_and(|p| p.is_fleet()))
+    }
 }
 
 const EMPTY_CANDIDATES: &[usize] = &[];
