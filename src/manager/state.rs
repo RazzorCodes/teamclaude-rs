@@ -52,6 +52,29 @@ impl Manager {
             .unwrap_or(true)
     }
 
+    /// Whether AGENT-level affinity is enabled, read from the config's unmodelled
+    /// top-level `agentAffinity` (default `false` — off unless explicitly
+    /// enabled). Meaningful only together with [`Self::session_affinity_enabled`]:
+    /// it does not mint its own `SessionKey` extension, it only changes what
+    /// `proxy::stable_session_key` HASHES once affinity is already on for the
+    /// connection. See that function's doc comment for the mechanism (TCR-8): with
+    /// `sessionAffinity` alone, one Claude Code session and every subagent/sidechain
+    /// it spawns pin to the SAME account, because they all carry the same
+    /// lineage-stable `metadata.user_id`. With `agentAffinity` also on, the pin key
+    /// is refined by the request's cacheable prefix (`system` + `tools`), which
+    /// Claude Code varies between the orchestrator and a subagent's system prompt —
+    /// so each agent within a session can land on its OWN account while its own
+    /// successive turns (same prefix) keep hitting the one it landed on.
+    pub fn agent_affinity_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .extra
+            .get("agentAffinity")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// Over-threshold revalidation-serve is ON by default; set top-level
     /// `"revalidationServe": false` in the config to disable it (pure fall-through
     /// to a synthesized 429 when the whole fleet reads over the soft threshold).

@@ -470,6 +470,59 @@ fn prefix_session_key(
     Some(hasher.finish())
 }
 
+/// Minimal shape reading only the request's CACHEABLE PREFIX — the top-level
+/// `system` and `tools` fields — as `&RawValue`, so the returned slices borrow
+/// the VERBATIM source bytes out of `body` rather than a re-serialized copy.
+/// Verbatim-ness matters here the same way it matters to Anthropic's own cache:
+/// a canonicalized/key-sorted re-encoding could call two prompts "the same" that
+/// Anthropic's byte-exact cache treats as distinct.
+///
+/// This is TCR-8's candidate agent-identity signal (see
+/// [`agent_prefix_component`] and [`stable_session_key`]): Claude Code's requests
+/// carry no explicit sub-agent id, but a Task-tool subagent runs under its own
+/// system prompt and typically a narrower tool set than the orchestrator that
+/// spawned it, while one agent's OWN successive turns keep that prefix
+/// byte-identical (Claude Code needs that invariant itself for ITS cache to hit).
+/// So this field is the best available proxy for "which agent, within this
+/// session, sent this request" — not a client-declared agent id, because Claude
+/// Code does not send one today. See `agentAffinity`'s doc comment in
+/// `manager::state` for the honest caveat: this has NOT been live-verified against
+/// a captured orchestrator/subagent request pair the way tier 2's `session_id`
+/// behavior was on 2026-07-16 — it is a reasoned inference from Claude Code's
+/// documented subagent architecture, not a measurement.
+#[derive(serde::Deserialize)]
+struct AgentPrefixPeek<'a> {
+    #[serde(borrow)]
+    system: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    tools: Option<&'a serde_json::value::RawValue>,
+}
+
+/// Hash of the request's cacheable prefix (`system` + `tools`, raw bytes), used
+/// by [`stable_session_key`] to refine a session-lineage key down to an
+/// agent-scoped one. `None` when the body carries NEITHER field — there is then
+/// nothing to distinguish one agent's requests from another's, so the caller
+/// falls back to the plain lineage key rather than manufacturing a fake split.
+///
+/// Namespaced under `"apx:"` (distinct from `stable_hash`'s `"key:"`/`"uid:"`) and
+/// hashes `system`/`tools` as a `(Option<&str>, Option<&str>)` pair — never
+/// concatenated into one string — so presence/absence of each field is part of
+/// the hash input and `str`'s own `Hash` impl (which appends a sentinel after
+/// each value) makes a `system`/`tools` boundary shift unable to collide two
+/// different prefixes onto the same hash.
+fn agent_prefix_component(body: &[u8]) -> Option<u64> {
+    let peek = serde_json::from_slice::<AgentPrefixPeek>(body).ok()?;
+    if peek.system.is_none() && peek.tools.is_none() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "apx:".hash(&mut hasher);
+    peek.system.map(|v| v.get()).hash(&mut hasher);
+    peek.tools.map(|v| v.get()).hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// Derive a STABLE affinity key from the client's most durable identity, so a
 /// session survives reconnects on one account (warm prompt cache). Priority:
 ///   1. the `x-api-key` header (distinct team keys → distinct accounts) — but
@@ -522,6 +575,22 @@ fn prefix_session_key(
 /// Returns `None` on absence/parse failure at every tier, which routes the
 /// request unpinned. The paired [`SessionKind`] records WHICH tier produced the
 /// key — display provenance only, never a routing input.
+///
+/// TCR-8 (`agent_affinity`, default off — see
+/// `Manager::agent_affinity_enabled`): tiers 1/2 above key on SESSION LINEAGE,
+/// which is deliberately IDENTICAL across a session's own subagents (that is
+/// what keeps a resume on the same account). That is also exactly what
+/// concentrates one session's ENTIRE quota draw — orchestrator plus every
+/// parallel subagent it spawns — onto a single pinned account. When
+/// `agent_affinity` is true and a lineage key was found (tier 1 or 2), this
+/// further mixes in [`agent_prefix_component`]: two requests with the same
+/// lineage but a DIFFERENT cacheable prefix (orchestrator vs. a subagent
+/// running a different system prompt) hash to DIFFERENT keys and can pin to
+/// different accounts, while one agent's own successive turns (same lineage,
+/// same prefix) keep hashing to the SAME key. A lineage request with no
+/// `system`/`tools` at all (nothing to distinguish) falls back to the plain
+/// lineage key, same as with the feature off. Tier 3 keys are already prefix-
+/// derived, so `agent_affinity` does not apply to them.
 fn stable_session_key(
     headers: &HeaderMap,
     body: &[u8],
@@ -529,12 +598,17 @@ fn stable_session_key(
     method: &Method,
     path: &str,
     client_is_loopback: bool,
+    agent_affinity: bool,
 ) -> Option<(u64, SessionKind)> {
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         // The shared proxy secret is not a client identity — skip it so remote
         // clients don't all collapse onto one account.
         if proxy_key != Some(key) {
-            return Some((stable_hash("key:", key), SessionKind::Stable));
+            let lineage_key = stable_hash("key:", key);
+            return Some((
+                apply_agent_affinity(lineage_key, body, agent_affinity),
+                SessionKind::Stable,
+            ));
         }
     }
 
@@ -547,7 +621,11 @@ fn stable_session_key(
         .and_then(|p| p.metadata.as_ref())
         .and_then(|m| m.user_id.as_deref())
     {
-        return Some((stable_hash("uid:", user_id), SessionKind::Stable));
+        let lineage_key = stable_hash("uid:", user_id);
+        return Some((
+            apply_agent_affinity(lineage_key, body, agent_affinity),
+            SessionKind::Stable,
+        ));
     }
 
     // Tier 3's scope guard — see the doc-comment above for why both halves are
@@ -558,6 +636,48 @@ fn stable_session_key(
     }
     let peek = peek?;
     prefix_session_key(peek.system, peek.tools).map(|key| (key, SessionKind::Prefix))
+}
+
+/// TCR-8's agent-affinity mix-in, applied to a tier 1/2 LINEAGE key. `false` for
+/// `agent_affinity` (the default) is a no-op — see [`stable_session_key`]'s
+/// doc-comment for the full contract.
+fn apply_agent_affinity(lineage_key: u64, body: &[u8], agent_affinity: bool) -> u64 {
+    if !agent_affinity {
+        return lineage_key;
+    }
+    match agent_prefix_component(body) {
+        Some(prefix) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            "agent:".hash(&mut hasher);
+            lineage_key.hash(&mut hasher);
+            prefix.hash(&mut hasher);
+            hasher.finish()
+        }
+        // No system/tools to distinguish agents by — fall back to the session-wide
+        // lineage key rather than inventing a split that isn't there.
+        None => lineage_key,
+    }
+}
+
+/// Test-only seam so `manager`'s tests can derive a REAL agent-scoped key (the
+/// same function the request path uses) instead of hand-rolling a hash that
+/// could silently drift from what `stable_session_key` actually computes. Fixed
+/// at a loopback `POST /v1/messages` so tier 3 is reachable too; no
+/// `x-api-key`/shared-proxy-key case: those tests only exercise the
+/// `metadata.user_id` + prefix path.
+#[cfg(test)]
+pub(crate) fn stable_session_key_for_test(body: &[u8], agent_affinity: bool) -> Option<u64> {
+    stable_session_key(
+        &HeaderMap::new(),
+        body,
+        None,
+        &Method::POST,
+        "/v1/messages",
+        true,
+        agent_affinity,
+    )
+    .map(|(key, _)| key)
 }
 
 /// Path of the read-only live-status endpoint [`status_handler`] serves.
@@ -1964,6 +2084,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             &method,
             &path,
             client_is_loopback,
+            manager.agent_affinity_enabled(),
         ) {
             Some((key, kind)) => (Some(key), kind),
             None => (None, SessionKind::Fallback),
@@ -3620,6 +3741,7 @@ mod tests {
         headers: &HeaderMap,
         body: &[u8],
         proxy_key: Option<&str>,
+        agent_affinity: bool,
     ) -> Option<(u64, SessionKind)> {
         stable_session_key(
             headers,
@@ -3628,6 +3750,7 @@ mod tests {
             &Method::POST,
             "/v1/messages",
             true,
+            agent_affinity,
         )
     }
 
@@ -3838,8 +3961,8 @@ mod tests {
     #[test]
     fn stable_session_key_is_deterministic_for_api_key() {
         let h = headers_with_api_key("sk-team-alice");
-        let a = messages_key(&h, b"{}", None);
-        let b = messages_key(&h, b"{}", None);
+        let a = messages_key(&h, b"{}", None, false);
+        let b = messages_key(&h, b"{}", None, false);
         assert_eq!(a, b, "same x-api-key must survive a reconnect");
         assert!(a.is_some());
     }
@@ -3848,8 +3971,8 @@ mod tests {
     fn stable_session_key_is_deterministic_for_user_id() {
         let body = br#"{"metadata":{"user_id":"user-123"},"messages":[]}"#;
         let h = HeaderMap::new();
-        let a = messages_key(&h, body, None);
-        let b = messages_key(&h, body, None);
+        let a = messages_key(&h, body, None, false);
+        let b = messages_key(&h, body, None, false);
         assert_eq!(a, b, "same user_id must survive a reconnect");
         assert!(a.is_some());
     }
@@ -3857,19 +3980,20 @@ mod tests {
     #[test]
     fn stable_session_key_prefers_api_key_over_user_id() {
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
-        let with_key = messages_key(&headers_with_api_key("the-key"), body, None);
-        let key_only = messages_key(&headers_with_api_key("the-key"), b"{}", None);
+        let with_key = messages_key(&headers_with_api_key("the-key"), body, None, false);
+        let key_only = messages_key(&headers_with_api_key("the-key"), b"{}", None, false);
         assert_eq!(with_key, key_only, "x-api-key must win over user_id");
     }
 
     #[test]
     fn stable_session_key_namespaces_key_vs_uid() {
         // An x-api-key "abc" and a user_id "abc" must NOT collide.
-        let from_key = messages_key(&headers_with_api_key("abc"), b"{}", None);
+        let from_key = messages_key(&headers_with_api_key("abc"), b"{}", None, false);
         let from_uid = messages_key(
             &HeaderMap::new(),
             br#"{"metadata":{"user_id":"abc"}}"#,
             None,
+            false,
         );
         assert_ne!(from_key, from_uid, "prefixes must isolate the two spaces");
     }
@@ -3879,7 +4003,7 @@ mod tests {
         // No x-api-key, no top-level metadata.user_id, no system/tools → None
         // even ON the endpoint and origin tier 3 is scoped to.
         assert_eq!(
-            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
+            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None, false),
             None
         );
     }
@@ -3888,13 +4012,13 @@ mod tests {
     fn stable_session_key_ignores_nested_user_id() {
         // A user_id nested in message content is NOT top-level metadata.
         let body = br#"{"messages":[{"role":"user","content":{"metadata":{"user_id":"nested"}}}]}"#;
-        assert_eq!(messages_key(&HeaderMap::new(), body, None), None);
+        assert_eq!(messages_key(&HeaderMap::new(), body, None, false), None);
     }
 
     #[test]
     fn stable_session_key_distinguishes_different_api_keys() {
-        let a = messages_key(&headers_with_api_key("key-a"), b"{}", None);
-        let b = messages_key(&headers_with_api_key("key-b"), b"{}", None);
+        let a = messages_key(&headers_with_api_key("key-a"), b"{}", None, false);
+        let b = messages_key(&headers_with_api_key("key-b"), b"{}", None, false);
         assert_ne!(a, b, "distinct team keys → distinct accounts");
     }
 
@@ -3907,14 +4031,14 @@ mod tests {
         let shared = "sk-proxy-secret";
         // No user_id → falls through to None (per-connection key at the caller).
         assert_eq!(
-            messages_key(&headers_with_api_key(shared), b"{}", Some(shared)),
+            messages_key(&headers_with_api_key(shared), b"{}", Some(shared), false),
             None,
             "the shared proxy key must not be used as an affinity discriminator"
         );
         // With a body user_id, it falls through to that instead of the shared key.
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
-        let via_shared = messages_key(&headers_with_api_key(shared), body, Some(shared));
-        let via_uid = messages_key(&HeaderMap::new(), body, None);
+        let via_shared = messages_key(&headers_with_api_key(shared), body, Some(shared), false);
+        let via_uid = messages_key(&HeaderMap::new(), body, None, false);
         assert_eq!(
             via_shared, via_uid,
             "with the shared key skipped, the user_id is the discriminator"
@@ -3922,7 +4046,12 @@ mod tests {
         assert!(via_shared.is_some());
         // A DIFFERENT (genuine team) key with the same proxy_key configured is
         // still used — only the exact shared secret is skipped.
-        let team = messages_key(&headers_with_api_key("sk-team-alice"), b"{}", Some(shared));
+        let team = messages_key(
+            &headers_with_api_key("sk-team-alice"),
+            b"{}",
+            Some(shared),
+            false,
+        );
         assert!(
             team.is_some(),
             "a distinct team key is a real identity and must still key"
@@ -3935,8 +4064,8 @@ mod tests {
         // in-scope (loopback POST /v1/messages) request — tier 3 pins on a hash
         // of that prefix instead of routing unpinned.
         let body = br#"{"system":"You are a helpful assistant.","tools":[{"name":"bash"}]}"#;
-        let a = messages_key(&HeaderMap::new(), body, None);
-        let b = messages_key(&HeaderMap::new(), body, None);
+        let a = messages_key(&HeaderMap::new(), body, None, false);
+        let b = messages_key(&HeaderMap::new(), body, None, false);
         assert_eq!(a, b, "same prefix must hash the same every time");
         assert_eq!(
             a.map(|(_, kind)| kind),
@@ -3948,8 +4077,13 @@ mod tests {
     #[test]
     fn stable_session_key_prefix_hash_accepts_system_or_tools_alone() {
         // Either field alone is a cacheable prefix — both need not be present.
-        let system_only = messages_key(&HeaderMap::new(), br#"{"system":"hi"}"#, None);
-        let tools_only = messages_key(&HeaderMap::new(), br#"{"tools":[{"name":"x"}]}"#, None);
+        let system_only = messages_key(&HeaderMap::new(), br#"{"system":"hi"}"#, None, false);
+        let tools_only = messages_key(
+            &HeaderMap::new(),
+            br#"{"tools":[{"name":"x"}]}"#,
+            None,
+            false,
+        );
         assert!(system_only.is_some(), "system alone must pin");
         assert!(tools_only.is_some(), "tools alone must pin");
         assert_ne!(
@@ -3960,8 +4094,8 @@ mod tests {
 
     #[test]
     fn stable_session_key_prefix_hash_distinguishes_different_prefixes() {
-        let a = messages_key(&HeaderMap::new(), br#"{"system":"prompt A"}"#, None);
-        let b = messages_key(&HeaderMap::new(), br#"{"system":"prompt B"}"#, None);
+        let a = messages_key(&HeaderMap::new(), br#"{"system":"prompt A"}"#, None, false);
+        let b = messages_key(&HeaderMap::new(), br#"{"system":"prompt B"}"#, None, false);
         assert_ne!(
             a, b,
             "distinct prefixes must spread across the fleet, not collide"
@@ -3974,8 +4108,18 @@ mod tests {
         // own cache is byte-exact, so these are two DIFFERENT cache entries —
         // canonicalizing (sorting keys) before hashing would merge them onto one
         // account for zero cache benefit and only concentrate load.
-        let a = messages_key(&HeaderMap::new(), br#"{"system":{"a":1,"b":2}}"#, None);
-        let b = messages_key(&HeaderMap::new(), br#"{"system":{"b":2,"a":1}}"#, None);
+        let a = messages_key(
+            &HeaderMap::new(),
+            br#"{"system":{"a":1,"b":2}}"#,
+            None,
+            false,
+        );
+        let b = messages_key(
+            &HeaderMap::new(),
+            br#"{"system":{"b":2,"a":1}}"#,
+            None,
+            false,
+        );
         assert_ne!(
             a, b,
             "raw bytes must be hashed verbatim — key order must not be canonicalized"
@@ -3990,8 +4134,8 @@ mod tests {
         // `{"system":"ab"}` (tools absent, so "" via unwrap_or) and
         // `{"tools":"ab"}` (system absent) as the identical string "ab" and hash
         // them the same. Hashing each field as its own `Option<&str>` must not.
-        let system_ab = messages_key(&HeaderMap::new(), br#"{"system":"ab"}"#, None);
-        let tools_ab = messages_key(&HeaderMap::new(), br#"{"tools":"ab"}"#, None);
+        let system_ab = messages_key(&HeaderMap::new(), br#"{"system":"ab"}"#, None, false);
+        let tools_ab = messages_key(&HeaderMap::new(), br#"{"tools":"ab"}"#, None, false);
         assert_ne!(
             system_ab, tools_ab,
             "system:\"ab\" and tools:\"ab\" must not collide"
@@ -4008,8 +4152,18 @@ mod tests {
         // to "123". `str`'s own `Hash` impl appends a sentinel byte after each
         // value specifically to prevent this; hashing system and tools as two
         // separate `.hash()` calls relies on it.
-        let a = messages_key(&HeaderMap::new(), br#"{"system":12,"tools":3}"#, None);
-        let b = messages_key(&HeaderMap::new(), br#"{"system":1,"tools":23}"#, None);
+        let a = messages_key(
+            &HeaderMap::new(),
+            br#"{"system":12,"tools":3}"#,
+            None,
+            false,
+        );
+        let b = messages_key(
+            &HeaderMap::new(),
+            br#"{"system":1,"tools":23}"#,
+            None,
+            false,
+        );
         assert_ne!(a, b, "a field boundary shift must not collide");
     }
 
@@ -4019,7 +4173,7 @@ mod tests {
         // in scope. This is the guard that stops every trivial anonymous
         // request from piling onto one account.
         assert_eq!(
-            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
+            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None, false),
             None
         );
     }
@@ -4029,10 +4183,11 @@ mod tests {
         // x-api-key and metadata.user_id both outrank the prefix hash even when a
         // cacheable prefix is also present.
         let body = br#"{"system":"hi","metadata":{"user_id":"user-123"}}"#;
-        let with_key = messages_key(&headers_with_api_key("the-key"), body, None).map(|(_, k)| k);
+        let with_key =
+            messages_key(&headers_with_api_key("the-key"), body, None, false).map(|(_, k)| k);
         assert_eq!(with_key, Some(SessionKind::Stable), "x-api-key still wins");
 
-        let with_uid = messages_key(&HeaderMap::new(), body, None).map(|(_, k)| k);
+        let with_uid = messages_key(&HeaderMap::new(), body, None, false).map(|(_, k)| k);
         assert_eq!(
             with_uid,
             Some(SessionKind::Stable),
@@ -4055,6 +4210,7 @@ mod tests {
                 &Method::POST,
                 "/v1/messages",
                 true,
+                false,
             )
             .is_some(),
             "an exact /v1/messages match must pin"
@@ -4071,6 +4227,7 @@ mod tests {
                 &Method::POST,
                 "/v1/messages/count_tokens",
                 true,
+                false,
             ),
             None,
             "/v1/messages/count_tokens must NOT prefix-match /v1/messages"
@@ -4087,6 +4244,7 @@ mod tests {
                 &Method::POST,
                 "/v1/messages?beta=true",
                 true,
+                false,
             ),
             None,
             "a path carrying its query string must not match /v1/messages"
@@ -4103,6 +4261,7 @@ mod tests {
                 &Method::GET,
                 "/v1/messages",
                 true,
+                false,
             ),
             None,
             "a GET must not pin on the cacheable prefix"
@@ -4124,6 +4283,7 @@ mod tests {
                 None,
                 &Method::POST,
                 "/v1/messages",
+                false,
                 false,
             ),
             None,
@@ -4229,6 +4389,78 @@ mod tests {
             "a loopback POST /v1/messages?beta=true with a system field and no \
              identity must pin via tier 3 through the REAL call site, not just \
              the unit-tested function"
+        );
+    }
+
+    /// TCR-8, baseline behavior: an orchestrator's request and its subagent's
+    /// request share ONE `metadata.user_id` lineage — that is what today's
+    /// session-level affinity relies on to survive a resume — so with
+    /// `agent_affinity` OFF they collapse onto the exact same key regardless of
+    /// how different their `system`/`tools` prefixes are. This is the "watch it
+    /// fail" baseline for TCR-8: it is the behavior that concentrates a whole
+    /// session's quota draw onto one pinned account.
+    #[test]
+    fn stable_session_key_agent_affinity_off_collapses_orchestrator_and_subagent() {
+        let lineage = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are the orchestrator.","tools":[{"name":"Task"}]}"#;
+        let subagent = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are a code-search subagent.","tools":[{"name":"Grep"}]}"#;
+        let a = messages_key(&HeaderMap::new(), lineage, None, false);
+        let b = messages_key(&HeaderMap::new(), subagent, None, false);
+        assert_eq!(
+            a, b,
+            "with agent_affinity off, same lineage must collapse to one key \
+             regardless of prefix — this is the TCR-8 problem, not a bug"
+        );
+    }
+
+    /// TCR-8's fix: with `agent_affinity` ON, the SAME two requests as above —
+    /// one lineage, two different cacheable prefixes (orchestrator vs. subagent
+    /// system prompt + tools) — must hash to DIFFERENT keys, so they can pin to
+    /// different accounts.
+    #[test]
+    fn stable_session_key_agent_affinity_on_distinguishes_orchestrator_and_subagent() {
+        let lineage = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are the orchestrator.","tools":[{"name":"Task"}]}"#;
+        let subagent = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are a code-search subagent.","tools":[{"name":"Grep"}]}"#;
+        let a = messages_key(&HeaderMap::new(), lineage, None, true);
+        let b = messages_key(&HeaderMap::new(), subagent, None, true);
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(
+            a, b,
+            "distinct cacheable prefixes under one lineage must produce distinct \
+             agent-scoped keys"
+        );
+    }
+
+    /// The other half of the contract: one agent's OWN successive turns keep the
+    /// SAME lineage AND the same cacheable prefix (Claude Code needs that
+    /// invariant itself for its own cache to hit), so `agent_affinity` must not
+    /// introduce any turn-to-turn instability — repeat requests hash identically.
+    #[test]
+    fn stable_session_key_agent_affinity_on_is_stable_across_one_agents_turns() {
+        let turn1 = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are a code-search subagent.","tools":[{"name":"Grep"}]}"#;
+        let turn2 = br#"{"metadata":{"user_id":"session-lineage-1"},"system":"You are a code-search subagent.","tools":[{"name":"Grep"}]}"#;
+        let a = messages_key(&HeaderMap::new(), turn1, None, true);
+        let b = messages_key(&HeaderMap::new(), turn2, None, true);
+        assert!(a.is_some());
+        assert_eq!(
+            a, b,
+            "one agent's own successive turns must keep hashing to the same key"
+        );
+    }
+
+    /// With `agent_affinity` ON but NO cacheable prefix at all (neither `system`
+    /// nor `tools`), there is nothing to distinguish agents by — the key must
+    /// fall back to the plain lineage key, identical to the feature being off, so
+    /// such a request is not silently forced unpinned or given a fake identity.
+    #[test]
+    fn stable_session_key_agent_affinity_on_falls_back_without_a_prefix() {
+        let body = br#"{"metadata":{"user_id":"session-lineage-1"}}"#;
+        let off = messages_key(&HeaderMap::new(), body, None, false);
+        let on = messages_key(&HeaderMap::new(), body, None, true);
+        assert!(off.is_some());
+        assert_eq!(
+            off, on,
+            "no system/tools to distinguish by → agent_affinity must fall back to \
+             the plain lineage key"
         );
     }
 

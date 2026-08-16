@@ -27,6 +27,8 @@ several Claude accounts, refreshes their OAuth tokens, and shows what each one h
 - Two entry modes on one port (base-URL and forward-proxy), chosen per connection.
 - A live terminal dashboard, on macOS and Linux alike, showing everything the app shows.
 - Session affinity keeps a conversation on one account, so its prompt cache stays warm.
+- Agent affinity (prototype, TCR-8) refines that to per-agent granularity, so a session's
+  subagents can spread across accounts instead of stacking on one.
 - Drop-in for the Node [teamclaude](https://github.com/KarpelesLab/teamclaude): same config, certs and port.
 
 ## Install
@@ -75,6 +77,19 @@ trust it. `tcr` prints the CA path to advertise when it starts. Config lives at
 `~/.config/teamclaude.json`, where `name` and `accessToken` are the only required keys.
 Every other key, its default and the file's permissions are in
 [`docs/configuration.md`](docs/configuration.md).
+
+`"agentAffinity": true` (prototype, TCR-8) refines `sessionAffinity` from session-lineage
+granularity to AGENT granularity: with `sessionAffinity` alone, a Claude Code session and every
+subagent it spawns share one lineage-stable identity and so pin to the SAME account, meaning one
+session's whole aggregate quota draw — orchestrator plus every parallel subagent/fork — lands on
+a single subscription. With `agentAffinity` also on, the pin key additionally hashes the
+request's cacheable prefix (`system` + `tools`), which differs between an orchestrator and a
+subagent running its own system prompt, so each agent within a session can pin to a DIFFERENT
+account while its own successive turns (same prefix) keep hitting the one it landed on.
+Meaningless without `sessionAffinity` also set, and off by default. This is a design spike, not
+a hardened feature: Claude Code sends no explicit sub-agent id today, so the prefix hash is a
+reasoned proxy for agent identity, not a live-verified one the way `sessionAffinity`'s `user_id`
+tier is — see `stable_session_key`'s doc comment in `src/proxy.rs` for the honest caveat.
 
 ## Menu bar app
 

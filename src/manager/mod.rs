@@ -4801,6 +4801,112 @@ mod tests {
         assert_eq!(session.last_served_account, "b");
     }
 
+    /// TCR-8 prototype, end to end at the `Manager` seam: one session lineage
+    /// (a single `metadata.user_id`) spawns two agents — an orchestrator and a
+    /// subagent — that `proxy::stable_session_key` (with `agent_affinity` on)
+    /// hashes to DIFFERENT keys because their `system`/`tools` prefixes differ.
+    /// Selecting on those two keys against a 2-account fleet must land them on
+    /// DIFFERENT accounts (spreading the session's quota draw), while each
+    /// agent's own repeated request keeps hitting the SAME account it first
+    /// landed on (turn-to-turn cache warmth). This is the gate's own language:
+    /// "one session's sub-agents landing on different accounts while each
+    /// agent's own successive turns hit the same account."
+    #[test]
+    fn tcr8_agent_scoped_keys_spread_one_sessions_agents_across_accounts() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+
+        // Same lineage, different cacheable prefixes — exactly what
+        // `proxy::stable_session_key` produces for an orchestrator vs. a subagent
+        // sharing one `metadata.user_id` when `agent_affinity` is enabled.
+        let orchestrator_key = crate::proxy::stable_session_key_for_test(
+            br#"{"metadata":{"user_id":"lineage-1"},"system":"You are the orchestrator.","tools":[{"name":"Task"}]}"#,
+            true,
+        )
+        .expect("orchestrator request has a lineage + prefix");
+        let subagent_key = crate::proxy::stable_session_key_for_test(
+            br#"{"metadata":{"user_id":"lineage-1"},"system":"You are a code-search subagent.","tools":[{"name":"Grep"}]}"#,
+            true,
+        )
+        .expect("subagent request has a lineage + prefix");
+        assert_ne!(
+            orchestrator_key, subagent_key,
+            "precondition: distinct prefixes under one lineage must hash differently"
+        );
+
+        // First turn of each agent: brand-new pins go through the SAME weighted
+        // selection as session affinity always has (TCR-8 does not bypass TCR-5).
+        let orchestrator_account = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                Some(orchestrator_key),
+                "/v1/messages",
+                None,
+            )
+            .expect("orchestrator pins to an account");
+        manager.record_served(
+            orchestrator_account,
+            now,
+            Some(orchestrator_key),
+            SessionKind::Stable,
+        );
+        let subagent_account = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                Some(subagent_key),
+                "/v1/messages",
+                None,
+            )
+            .expect("subagent pins to an account");
+        manager.record_served(
+            subagent_account,
+            now,
+            Some(subagent_key),
+            SessionKind::Stable,
+        );
+        assert_ne!(
+            orchestrator_account, subagent_account,
+            "one session's two agents must spread across DIFFERENT accounts, not \
+             concentrate on one"
+        );
+
+        // Each agent's OWN successive turn must keep landing on the account it
+        // first pinned to — the cache-warmth half of the contract.
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    now,
+                    None,
+                    Some(orchestrator_key),
+                    "/v1/messages",
+                    None
+                ),
+                Some(orchestrator_account),
+                "the orchestrator's own repeated turns must stay on its own pin"
+            );
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    now,
+                    None,
+                    Some(subagent_key),
+                    "/v1/messages",
+                    None
+                ),
+                Some(subagent_account),
+                "the subagent's own repeated turns must stay on its own pin"
+            );
+        }
+    }
+
     /// Serving a request must not re-order the sessions pane. Rows used to sort
     /// most-recent-first, so every single request threw its session to the top and
     /// the pane churned under the operator's eyes — the other half of why a stable
