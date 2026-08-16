@@ -132,6 +132,11 @@ impl Manager {
         &self.upstream
     }
 
+    /// The TCR-2 provider routing table, snapshotted from config at boot.
+    pub fn routing(&self) -> &crate::routing::RoutingTable {
+        &self.routing
+    }
+
     pub fn proxy_api_key(&self) -> Option<&str> {
         self.proxy_api_key.as_deref()
     }

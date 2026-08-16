@@ -282,9 +282,96 @@ pub struct Config {
     pub http1_only: bool,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Named third-party (or fleet) API providers TCR-2 routing may dispatch to.
+    /// Absent/empty key -> [`RoutingTable::from_config`] builds a fully inert
+    /// table and every request takes today's first-party path unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<Provider>,
+    /// Per-model routing rules: a request model glob -> an ordered, prioritized
+    /// list of `providers[].name` candidates. See [`crate::routing::RoutingTable`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_routes: Vec<ModelRoute>,
     /// Any top-level keys we do not model, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// One configured API provider (`providers[]`) — a named upstream endpoint plus
+/// how to authenticate to it and which models it may serve. Resolved into a
+/// [`crate::routing::ResolvedProvider`] at boot by
+/// [`crate::routing::RoutingTable::from_config`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Provider {
+    /// Unique name, referenced by `model_routes[].candidates`. A duplicate name
+    /// is a hard boot error (see [`crate::routing::RoutingTable::from_config`]).
+    pub name: String,
+    /// No trailing slash — the routing layer appends `path_and_query` directly.
+    pub base_url: String,
+    pub auth: ProviderAuth,
+    /// Advisory glob allowlist of model ids this provider can serve. Not
+    /// enforced (a route naming a candidate whose `models` can't serve it is a
+    /// warning, not a drop) — it exists for `dump()`/operator documentation.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Request model id -> this provider's own model id, for providers that do
+    /// not accept Anthropic model ids verbatim.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub model_map: Map<String, Value>,
+    /// Additive vendor headers sent on every request to this provider.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub headers: Map<String, Value>,
+}
+
+/// How to authenticate to a [`Provider`]. NEVER an inline secret — a credential
+/// is always indirected through an environment variable or a file on disk, so a
+/// config file (which this repo treats as world-readable) never itself carries
+/// one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProviderAuth {
+    /// Read the secret from environment variable `var` at boot.
+    #[serde(rename_all = "camelCase")]
+    Env {
+        var: String,
+        /// Header to inject the credential under. Defaults to `authorization`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header: Option<String>,
+        /// Prepended to the secret value before injection. Defaults to `"Bearer "`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+    /// Read the secret from the file at `path` at boot. The file must be
+    /// owner-only readable (mode `0600` or tighter) — see
+    /// [`crate::routing::RoutingTable::from_config`].
+    #[serde(rename_all = "camelCase")]
+    File {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+    /// Not a third-party credential at all: route through the existing pooled
+    /// OAuth account fleet unchanged. At most one [`Provider`] may declare this.
+    Fleet,
+}
+
+/// One `model_routes[]` entry: a request model glob bound to an ordered,
+/// prioritized list of provider candidates. See
+/// [`crate::routing::RoutingTable`] for how these compile and match.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoute {
+    /// Glob (`*` only, ASCII case-insensitive) over the request's top-level
+    /// `model` field.
+    pub model: String,
+    /// Lower wins. Ties between routes with different globs are a boot warning
+    /// (declaration order silently decides).
+    pub priority: i64,
+    /// Ordered `providers[].name` references. First-match-wins across ROUTES;
+    /// this list is the ordered FALLBACK ladder within the one matched route.
+    pub candidates: Vec<String>,
 }
 
 /// The default config path: `$HOME/.config/teamclaude.json`.

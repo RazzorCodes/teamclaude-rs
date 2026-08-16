@@ -218,6 +218,8 @@ impl Fleet {
             control_account: None,
             control_reserve: 0.05,
             http1_only: false,
+            providers: vec![],
+            model_routes: vec![],
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
             extra: serde_json::Map::new(),
         };

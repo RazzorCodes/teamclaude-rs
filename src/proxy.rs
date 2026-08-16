@@ -3586,6 +3586,8 @@ mod tests {
             control_account: None,
             control_reserve: 0.05,
             http1_only: false,
+            providers: vec![],
+            model_routes: vec![],
             accounts: vec![Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),

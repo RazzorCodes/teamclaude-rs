@@ -833,6 +833,10 @@ pub struct Manager {
     config_write: Mutex<()>,
     config_path: Option<PathBuf>,
     upstream: String,
+    /// TCR-2 provider routing table, snapshotted from config at construction —
+    /// a fully inert table (empty providers/routes) when unconfigured, so the
+    /// no-routing build is byte-identical. See [`crate::routing::RoutingTable`].
+    routing: Arc<crate::routing::RoutingTable>,
     proxy_api_key: Option<String>,
     global_threshold: f64,
     /// Per-account request pacing knobs, snapshotted from the config at
@@ -1045,6 +1049,15 @@ impl Manager {
         accounts: Vec<AccountRuntime>,
     ) -> Arc<Self> {
         let upstream = config.upstream.clone();
+        let (routing, routing_warnings) = crate::routing::RoutingTable::from_config(&config);
+        for w in &routing_warnings {
+            if let Some(msg) = w.strip_prefix("hard error: ") {
+                tracing::error!(warning = %msg, "provider routing config error — falling back to fleet-only routing");
+            } else {
+                tracing::warn!(warning = %w, "provider routing config warning");
+            }
+        }
+        let routing = Arc::new(routing);
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let pacing = config.pacing.clone();
@@ -1092,6 +1105,7 @@ impl Manager {
             config_write: Mutex::new(()),
             config_path,
             upstream,
+            routing,
             proxy_api_key,
             global_threshold,
             pacing,
@@ -2364,6 +2378,8 @@ mod tests {
             control_account: None,
             control_reserve: 0.05,
             http1_only: false,
+            providers: vec![],
+            model_routes: vec![],
             accounts,
             extra: serde_json::Map::new(),
         }
