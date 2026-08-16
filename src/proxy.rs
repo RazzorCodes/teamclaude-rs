@@ -11168,5 +11168,202 @@ mod tests {
             std::env::remove_var("TCR2_TEST_HANG_VAR_B");
             std::env::remove_var("TCR2_TEST_HANG_VAR_A");
         }
+
+        // === TCR-7: fleet-exhaustion resume into a configured fallback candidate
+        //
+        // Everything above this point is TCR-2's original fixture set, unmodified.
+        // These tests exercise the NEW resume path: `["fleet", "deepseek"]` (fleet
+        // primary, deepseek overflow) — the ordering the ADR (§6) showed TCR-2's
+        // `dispatch_provider_route` could not express on its own, because reaching
+        // the `Fleet` hop at index 0 returned `None` immediately and the fleet
+        // loop's own exhaustion had no way back into the route.
+
+        /// Like [`config_with_routes`], but with a REAL, dispatchable fleet: N
+        /// pooled accounts against a real scripted `anthropic_upstream`, rather
+        /// than that helper's single account bound to a dead `127.0.0.1:1` (fine
+        /// for TCR-2's tests, which never let the walk fall through to the fleet
+        /// loop at all — TCR-7's tests need the fleet loop to actually run and
+        /// exhaust).
+        fn config_with_fleet_and_fallback(
+            anthropic_upstream: SocketAddr,
+            account_names: &[&str],
+            fallback: Option<Provider>,
+        ) -> Config {
+            let mut config = dummy_config(None, &format!("http://{anthropic_upstream}"));
+            let mut accounts = Vec::new();
+            for name in account_names {
+                let mut a = config.accounts[0].clone();
+                a.name = (*name).to_string();
+                accounts.push(a);
+            }
+            config.accounts = accounts;
+            let fleet_provider = provider("fleet", "https://unused.invalid", ProviderAuth::Fleet);
+            match fallback {
+                Some(fb) => {
+                    let candidates = ["fleet".to_string(), fb.name.clone()];
+                    config.providers = vec![fleet_provider, fb];
+                    config.model_routes = vec![route(
+                        "claude-*",
+                        0,
+                        &candidates.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )];
+                }
+                None => {
+                    // Regression fixture: a route with "fleet" and NOTHING after it —
+                    // must behave exactly as an unconfigured proxy on fleet
+                    // exhaustion (still 429).
+                    config.providers = vec![fleet_provider];
+                    config.model_routes = vec![route("claude-*", 0, &["fleet"])];
+                }
+            }
+            config
+        }
+
+        /// Build a `Manager` directly over `config` with a non-refreshing token
+        /// refresher (accounts start with a long-lived token, same as
+        /// `super::fleet`) — reused here because that helper hard-codes
+        /// `providers`/`model_routes` to empty via `dummy_config`, and TCR-7's
+        /// fixtures need both populated.
+        fn fleet_manager(config: Config) -> Arc<Manager> {
+            struct NoRefresh;
+            impl crate::oauth::TokenRefresher for NoRefresh {
+                fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                    Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+                }
+            }
+            Manager::new(
+                config,
+                Arc::new(NoRefresh),
+                Arc::new(crate::probe::LiveUsageProber::new()),
+                Arc::new(crate::warmer::LiveWarmer::new()),
+                None,
+            )
+        }
+
+        /// THE GATE: every pooled Anthropic account durably exhausted (`429`,
+        /// `anthropic-ratelimit-unified-status: rejected`) must resume the route
+        /// into the configured `deepseek` overflow candidate — model translated,
+        /// response forwarded in Anthropic's shape — rather than a hard 429.
+        #[tokio::test]
+        async fn fleet_exhaustion_resumes_into_configured_fallback() {
+            let (anthropic_addr, anthropic_attempts) = spawn_counted_upstream(vec![
+                Some(raw_429_rejected(3600)), // account "a": durable
+                Some(raw_429_rejected(3600)), // account "b": durable
+            ])
+            .await;
+            let (deepseek_url, deepseek_records) =
+                spawn_provider_upstream(200, r#"{"ok":true,"id":"msg_fallback"}"#).await;
+
+            std::env::set_var("TCR7_TEST_FALLBACK_VAR", "fallback-secret");
+            let mut deepseek = provider(
+                "deepseek",
+                &deepseek_url,
+                env_auth("TCR7_TEST_FALLBACK_VAR"),
+            );
+            deepseek.model_map.insert(
+                "claude-x".to_string(),
+                Value::String("deepseek-chat".to_string()),
+            );
+
+            let config =
+                config_with_fleet_and_fallback(anthropic_addr, &["a", "b"], Some(deepseek));
+            let manager = fleet_manager(config);
+
+            let (status, body) = post_one_with_body(manager.clone()).await;
+            assert_eq!(
+                status, 200,
+                "the whole fleet is durably exhausted — the request must be served \
+                 by the configured deepseek overflow, not a 429: {body}"
+            );
+            assert!(
+                !body.contains("exhausted"),
+                "a synthesized-exhaustion body means the resume never fired: {body}"
+            );
+
+            assert_eq!(
+                anthropic_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "both pooled accounts must have been tried and durably rejected \
+                 before the resume is reached"
+            );
+
+            let seen = deepseek_records.lock().await;
+            assert_eq!(
+                seen.len(),
+                1,
+                "deepseek must have received exactly one request — the fallback"
+            );
+            let v: Value = serde_json::from_str(&seen[0].body).unwrap();
+            assert_eq!(
+                v["model"], "deepseek-chat",
+                "the resumed hop must translate the model id the same way the \
+                 pre-loop dispatch does"
+            );
+            assert!(
+                seen[0]
+                    .headers
+                    .iter()
+                    .any(|(n, v)| n == "authorization" && v == "Bearer fallback-secret"),
+                "deepseek's own credential must be injected on the resumed hop: {:?}",
+                seen[0].headers
+            );
+
+            // Account-indexed bookkeeping: the fallback hit must not be attributed
+            // to any pooled account. Both accounts were durably rejected by the
+            // fleet loop itself (expected — that is what "exhausted" means), but
+            // NEITHER may show a served request, since the response the client
+            // received came from deepseek, not from either of them.
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            for a in &snap.accounts {
+                assert_eq!(
+                    a.requests, 0,
+                    "account {:?} shows a served request, but the client's 200 came \
+                     from the deepseek fallback — no pooled account may be credited \
+                     with it",
+                    a.name
+                );
+                assert!(
+                    a.rate_limited_until.is_some(),
+                    "account {:?} should still carry the durable hold the fleet \
+                     loop itself armed — the fallback must not have cleared it",
+                    a.name
+                );
+            }
+
+            std::env::remove_var("TCR7_TEST_FALLBACK_VAR");
+        }
+
+        /// Regression: a route with a `Fleet` candidate and NOTHING after it (or
+        /// no route at all) must still return the plain 429 on fleet exhaustion,
+        /// byte-identical to pre-TCR-7 behavior. This is the "unconfigured stays
+        /// unconfigured" guarantee TCR-2 established for the pre-loop dispatch;
+        /// TCR-7's resume must preserve it for the post-loop one too.
+        #[tokio::test]
+        async fn fleet_exhaustion_without_a_fallback_candidate_still_429s() {
+            let (anthropic_addr, anthropic_attempts) = spawn_counted_upstream(vec![
+                Some(raw_429_rejected(3600)),
+                Some(raw_429_rejected(3600)),
+            ])
+            .await;
+
+            let config = config_with_fleet_and_fallback(anthropic_addr, &["a", "b"], None);
+            let manager = fleet_manager(config);
+
+            let (status, body) = post_one_with_body(manager).await;
+            assert_eq!(
+                status, 429,
+                "no candidate configured after `Fleet` — exhaustion must still be \
+                 the honest 429: {body}"
+            );
+            assert!(
+                body.contains("exhausted"),
+                "expected the standard exhausted-fleet body, got: {body}"
+            );
+            assert_eq!(
+                anthropic_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "both accounts must still have been tried"
+            );
+        }
     }
 }
