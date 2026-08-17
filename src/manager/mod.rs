@@ -3596,11 +3596,11 @@ mod tests {
         // default, but AT/OVER a tighter 0.75 per-account override.
         let util = window(0.80, None);
 
-        let mut tight = AccountRuntime::from_config(&account("tight", 0));
+        let mut tight = AccountRuntime::from_config(&account("tight", 0), false);
         tight.switch_threshold = Some(0.75); // tighter than the 0.90 global default
         tight.quota.five_hour = Some(util);
 
-        let mut default = AccountRuntime::from_config(&account("default", 0));
+        let mut default = AccountRuntime::from_config(&account("default", 0), false);
         default.quota.five_hour = Some(util); // no override -> inherits 0.90
 
         assert!(
@@ -3640,11 +3640,11 @@ mod tests {
         // 0.95 per-account override.
         let util = window(0.92, None);
 
-        let mut loose = AccountRuntime::from_config(&account("loose", 0));
+        let mut loose = AccountRuntime::from_config(&account("loose", 0), false);
         loose.switch_threshold = Some(0.95); // looser than the 0.90 global default
         loose.quota.five_hour = Some(util);
 
-        let mut default = AccountRuntime::from_config(&account("default", 0));
+        let mut default = AccountRuntime::from_config(&account("default", 0), false);
         default.quota.five_hour = Some(util); // no override -> inherits 0.90
 
         assert!(
@@ -4046,7 +4046,7 @@ mod tests {
         set_five_hour_utilization(&manager, 2, 0.05, now);
 
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(2),
             "the least-utilized (most headroom) account must win a recency tie"
         );
@@ -4073,7 +4073,7 @@ mod tests {
 
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, None),
+                manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
                 Some(0),
                 "priority tier must dominate quota headroom, not the other way round"
             );
@@ -4115,7 +4115,7 @@ mod tests {
         let mut counts = [0usize; 3];
         for _ in 0..6 {
             let idx = manager
-                .select(&HashSet::new(), now, None, None)
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
                 .expect("an account is eligible");
             counts[idx] += 1;
         }
@@ -4187,7 +4187,7 @@ mod tests {
 
         for i in 0..TOTAL_PICKS {
             let idx = manager
-                .select(&HashSet::new(), now, None, None)
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
                 .expect("an account is eligible");
             counts[idx] += 1;
             if i >= WARMUP {
