@@ -1976,6 +1976,8 @@ mod revalidation_sticky_tests {
             control_account: None,
             control_reserve: 0.05,
             http1_only: false,
+            providers: vec![],
+            model_routes: vec![],
             accounts,
             extra: serde_json::Map::new(),
         }
@@ -2114,6 +2116,8 @@ mod sticky_divert_replay_tests {
             control_account: None,
             control_reserve: 0.05,
             http1_only: false,
+            providers: vec![],
+            model_routes: vec![],
             accounts,
             extra: serde_json::Map::new(),
         }

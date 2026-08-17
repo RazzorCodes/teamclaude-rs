@@ -154,6 +154,15 @@ impl Manager {
             .map(|a| a.http.clone())
     }
 
+    /// The shared, no-total-timeout client used for TCR-2 provider-dispatch
+    /// sends and other fleet-wide (not per-account) upstream calls. Distinct
+    /// from [`Self::http_client`] (per-account, tier-3 pinning) — see
+    /// [`Manager::provider_dispatch_timeout`] for why THIS client must not
+    /// gain a total timeout of its own.
+    pub fn fleet_http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
     /// Per-request timeout to apply to TCR-2 provider-dispatch sends (see the
     /// `provider_dispatch_timeout_ms` field doc for why the fleet client above
     /// must NOT get this same treatment).

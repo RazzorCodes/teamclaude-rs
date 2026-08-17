@@ -3086,7 +3086,7 @@ async fn dispatch_provider_route(
     body_bytes: &Bytes,
     start_hop: usize,
 ) -> Option<Response> {
-    let http = manager.http_client();
+    let http = manager.fleet_http_client();
     let (matched_glob, matched_priority) = route.matched().unwrap_or(("*", 0));
     let requested_model = crate::model::parse_request_model(body_bytes);
     let max_hops = route.len().min(MAX_PROVIDER_HOPS);
@@ -3143,7 +3143,7 @@ async fn dispatch_provider_route(
             .headers(build_provider_headers(req_headers, provider))
             // Bounded per-request timeout — see `Manager::provider_dispatch_timeout`
             // for why this does NOT belong on the shared fleet client that `http`
-            // (== manager.http_client()) also is. Without it, a third-party
+            // (== manager.fleet_http_client()) also is. Without it, a third-party
             // provider that accepts the TCP connection and then never responds
             // hangs `send().await` forever: `classify_provider_failure` never
             // gets called, so the walk never advances to the next candidate.

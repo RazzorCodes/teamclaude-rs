@@ -130,6 +130,8 @@ fn config(upstream: &str, throttle: ThrottleConfig, throttle_exempt_noise: bool)
         control_account: None,
         control_reserve: 0.05,
         http1_only: false,
+        providers: vec![],
+        model_routes: vec![],
         accounts: (0..POOL).map(account).collect(),
         extra,
     }
